@@ -185,6 +185,83 @@ __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restr
     for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
 }
 
+// An LDS-only workgroup barrier (gfx11's __syncthreads also waits for every outstanding global load).
+__device__ __forceinline__ void gdn_lds_bar() {
+#if defined(__HIP_PLATFORM_AMD__)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+    __syncthreads();
+#endif
+}
+// STRATA_GDN_COMMIT3=1 (gfx1150 work): the commit with one 256-thread block per head, each thread holding 64 rows of
+// one state column (two threads a column).  The 4-blocks-per-head commit read and wrote the state in 128-byte pieces
+// with only half of its 192 blocks resident (128 VGPRs), at ~40 GB/s each way: 581 -> ~490 ms of commits per 256-token
+// writing run on the 890M.  (Staging the tokens' k / v / gate / beta in LDS alone gained nothing; one whole column per
+// thread, or a VGPR cap, spills.)  Each column's sums are gdn_step_commit_kernel's: four fmaf chains over rows
+// rg*32 .. rg*32+31 in row order, added ((0 + 1) + 2) + 3, the same delta and the same fmaf update: the same bits.
+template <bool DBG>
+__global__ void __launch_bounds__(2 * S) gdn_step_commit3_kernel(float* __restrict__ state,
+                                                                 const float* __restrict__ hbuf, int C,
+                                                                 const float* __restrict__ gate,
+                                                                 const float* __restrict__ beta,
+                                                                 int h_k, int h_v,
+                                                                 const int32_t* __restrict__ n_keep, int n_max) {
+    const int n = *n_keep;
+    if (n <= 0) return;
+    if ((DBG && n > n_max) || n > kVerifyMaxT) {
+        if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0)
+            printf("strata DBG: gdn_step_commit3: n_keep %d is past the window's %d rows: commit skipped (#937)\n", n, n_max);
+        return;
+    }
+    constexpr int H = S / 2;                                  // rows per thread: row groups 2 half and 2 half + 1
+    __shared__ float sk[kVerifyMaxT][S];
+    __shared__ float sv[kVerifyMaxT][S];
+    __shared__ float sgb[2][kVerifyMaxT];
+    __shared__ float red[2][RG][S];
+    const int head = blockIdx.x;
+    const int col = threadIdx.x;
+    const int half = threadIdx.y;
+    const int tid = half * S + col;
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    const size_t row_stride = (size_t) h_v * S;
+    float* base = state + ((size_t) (half * H) * h_v + head) * S + col;
+    float s[H];
+#pragma unroll
+    for (int r = 0; r < H; ++r) s[r] = base[r * row_stride];
+    for (int i = tid; i < n * S; i += 2 * S) {
+        const int t = i / S, c = i % S;
+        const float* ht = hbuf + (size_t) t * C;
+        sk[t][c] = ht[qk + qh * S + c];
+        sv[t][c] = ht[2 * qk + head * S + c];
+    }
+    if (tid < n) {
+        sgb[0][tid] = __expf(gate[(size_t) tid * h_v + head]);
+        sgb[1][tid] = beta[(size_t) tid * h_v + head];
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int t = 0; t < n; ++t) {
+        const float g = sgb[0][t];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            float kv = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) kv = fmaf(s[j * RPG + r], sk[t][half * H + j * RPG + r], kv);
+            red[t & 1][2 * half + j][col] = kv;
+        }
+        gdn_lds_bar();
+        const float kv_col = red[t & 1][0][col] + red[t & 1][1][col] + red[t & 1][2][col] + red[t & 1][3][col];
+        const float delta = (sv[t][col] - g * kv_col) * sgb[1][t];
+#pragma unroll
+        for (int r = 0; r < H; ++r) s[r] = fmaf(g, s[r], sk[t][half * H + r] * delta);
+    }
+#pragma unroll
+    for (int r = 0; r < H; ++r) base[r * row_stride] = s[r];
+}
+
 // S26 (STRATA_QFUSE=1): the q8_1 image of a 32-column block, written by the warp that holds those columns with
 // native_quantize_q8_1_kernel's quantizer (the same XOR-tree max and sum, d = amax / 127, roundf(x / d), ds = (d, sum)).
 struct GdnQ81 { half2 ds; int8_t qs[32]; };
@@ -942,6 +1019,15 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     }();
     if (commit_split && n_keep != nullptr && t_out_begin >= n_tok) {
         static const bool dbg = [] { const char* e = std::getenv("STRATA_DBG_GDN"); return e && e[0] == '1'; }();
+        static const bool c3 = [] { const char* e = std::getenv("STRATA_GDN_COMMIT3"); return e && e[0] == '1'; }();
+        if (c3) {
+            if (dbg) gdn_step_commit3_kernel<true><<<dim3((unsigned) h_v), dim3(S, 2), 0, (cudaStream_t) stream>>>(
+                state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_tok);
+            else gdn_step_commit3_kernel<false><<<dim3((unsigned) h_v), dim3(S, 2), 0, (cudaStream_t) stream>>>(
+                state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_tok);
+            check("gdn_step_commit3");
+            return;
+        }
         if (dbg) gdn_step_commit_kernel<true><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_tok);
         else gdn_step_commit_kernel<false><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(

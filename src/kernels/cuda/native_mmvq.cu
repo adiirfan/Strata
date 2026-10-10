@@ -1279,7 +1279,10 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
-    if (rows1 && n_in / F::DIV >= F::BPI) {
+    // STRATA_HEAD_ROWS1=1 (gfx1150): the output head (n_out >= 65536) of a 4-token verify window on one row per block:
+    // 8.8 -> 6.2 ms per call on the 890M, where 2 and 3 tokens stay faster on two rows (bitwise the same either way)
+    static const bool head_rows1 = [] { const char* v = std::getenv("STRATA_HEAD_ROWS1"); return v && v[0] == '1'; }();
+    if ((rows1 || (head_rows1 && NCOLS == 4 && n_out >= 65536)) && n_in / F::DIV >= F::BPI) {
         if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
         else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
         return;

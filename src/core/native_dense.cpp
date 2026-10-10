@@ -326,7 +326,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     // STRATA_HC_Q8_INJECT=1 asks for a Q8_0 copy
                     static const bool q8_inject = [] { const char* v = std::getenv("STRATA_HC_Q8_INJECT"); return v && v[0] == '1'; }();
                     const bool f32_inject = q8_inject && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
-                    if ((tensor.type != 8 && !f32_inject) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;
+                    // STRATA_HC_Q8_BF16=1: a GGUF that keeps these projections as BF16 (SC117's GSQ-RCO) gets them rounded
+                    // to Q8_0 here, so the verify read moves 0.65 GiB a step instead of 1.20 (rounds differently)
+                    static const bool q8_bf16 = [] { const char* v = std::getenv("STRATA_HC_Q8_BF16"); return v && v[0] == '1'; }();
+                    const bool bf16_hc = q8_bf16 && tensor.type == 30 &&
+                                         (!tensor.name.ends_with("_inject.weight") || q8_inject);
+                    if ((tensor.type != 8 && !f32_inject && !bf16_hc) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;
                     auto found = table.table_.find(tensor.name);
                     if (found == table.table_.end() || found->second.hc_q8 != nullptr) continue;
                     auto& ref = found->second;
@@ -337,8 +342,15 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     void* p = nullptr;
                     std::vector<uint8_t> q8;
                     if (f32_inject) q8 = q8_0_of((const float*) gguf.tensor_data(tensor), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
+                    if (bf16_hc) {
+                        const uint64_t n = (uint64_t) ref.ne0 * (uint64_t) ref.ne1;
+                        const uint16_t* b = (const uint16_t*) gguf.tensor_data(tensor);
+                        std::vector<float> x((size_t) n);
+                        for (uint64_t i = 0; i < n; ++i) { const uint32_t u = (uint32_t) b[i] << 16; std::memcpy(&x[i], &u, 4); }
+                        q8 = q8_0_of(x.data(), n);
+                    }
                     if (cudaMalloc(&p, bytes) != cudaSuccess ||
-                        cudaMemcpy(p, f32_inject ? (const void*) q8.data() : gguf.tensor_data(tensor), bytes,
+                        cudaMemcpy(p, (f32_inject || bf16_hc) ? (const void*) q8.data() : gguf.tensor_data(tensor), bytes,
                                    cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }

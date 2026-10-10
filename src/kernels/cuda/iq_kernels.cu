@@ -2662,6 +2662,84 @@ void s27_launch_ts(bool ts, const NativeExpertLayout& L, int64_t cap_groups, cud
     else s27_launch<TG, TD, true, 4, 4, false>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
 }
 
+// STRATA_GU_R2=1 (Q2_0 gate/up, n_embd 2560; gfx1150 work): native_gu_multi_kernel's SUB16 path with RPS rows per
+// 16-lane subwarp (rows r0 and r0 + 16: 16 x RPS rows a block), every weight load of a group issued before the first
+// use, so a wave has RPS x 5 half-blocks of loads in flight instead of one row's.  Each row's sum is row_dot_80_sub16's
+// (k = t, t+32, t+64 into s; t+16, t+48 into s16; __fadd_rn; the 8-4-2-1 butterfly): the same bits.
+template<int RPS>
+__global__ void __launch_bounds__(256) native_gu_q20_rows_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                 const int32_t* __restrict__ grp_start,
+                                                                 const int32_t* __restrict__ n_groups,
+                                                                 const int32_t* __restrict__ ent_tok,
+                                                                 const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                                 float* __restrict__ gate, float* __restrict__ up) {
+    using S = Split<42>;
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    const int sw = threadIdx.x >> 4, t = threadIdx.x & 15;
+    const int row0 = blockIdx.x * (16 * RPS) + sw;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        S::W w[RPS][5];
+#pragma unroll
+        for (int q = 0; q < RPS; ++q) {
+            const int row = row0 + 16 * q;
+            const bool is_up = row >= L.n_ff;
+            const int r = is_up ? row - (int) L.n_ff : row;
+            const uint8_t* wr = (const uint8_t*) grp_ptr[g] + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
+#pragma unroll
+            for (int h = 0; h < 5; ++h) {
+                const int k = t + 16 * (h < 3 ? 2 * h : 2 * (h - 3) + 1);   // t, t+32, t+64, t+16, t+48
+                w[q][h] = S::load(wr, k / 2, k % 2);
+            }
+        }
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            int off[GRP_NC];
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * 80;
+#pragma unroll
+            for (int q = 0; q < RPS; ++q) {
+                const int row = row0 + 16 * q;
+                const bool is_up = row >= L.n_ff;
+                const int r = is_up ? row - (int) L.n_ff : row;
+                float sc[GRP_NC], s16[GRP_NC];
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c) { sc[c] = 0.0f; s16[c] = 0.0f; }
+#pragma unroll
+                for (int h = 0; h < 3; ++h) {
+                    const int k = t + 32 * h;
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (c < n) sc[c] += S::apply(w[q][h], xq + off[c] + (k / 2) * 2, k % 2);
+                }
+#pragma unroll
+                for (int h = 3; h < 5; ++h) {
+                    const int k = t + 16 + 32 * (h - 3);
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (c < n) s16[c] += S::apply(w[q][h], xq + off[c] + (k / 2) * 2, k % 2);
+                }
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c) {
+                    if (c < n) {
+                        sc[c] = __fadd_rn(sc[c], s16[c]);
+#pragma unroll
+                        for (int o = 8; o > 0; o >>= 1) sc[c] += __shfl_xor_sync(0xffffffffu, sc[c], o);
+                    }
+                }
+                if (row < 2 * L.n_ff) {
+                    float* dst = is_up ? up : gate;
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (c < n && t == c) dst[(size_t) (e + c) * L.n_ff + r] = sc[c];
+                }
+            }
+        }
+    }
+}
+bool g_gu_r2 = env_on("STRATA_GU_R2");
+
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
@@ -2678,9 +2756,89 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
         else native_gu_multi_kernel<TG, true, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     } else {
         if (g_no_sub16_gu) native_gu_multi_kernel<TG, false, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else if (TG == 42 && g_gu_r2 && L.n_embd == 2560 && (2 * L.n_ff) % 32 == 0) {
+            if constexpr (TG == 42) {
+                const dim3 g2((unsigned) (2 * L.n_ff / 32), grid.y);
+                native_gu_q20_rows_kernel<2><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            }
+        }
         else native_gu_multi_kernel<TG, false, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     }
 }
+
+// STRATA_DOWN_R4=1 (Q2_0 down, n_ff 640; gfx1150 work): native_down_multi_kernel's SUB_DOWN / TD 42 path with RPS rows
+// per 16-lane subwarp (16 x RPS rows a block instead of 16), so one staging of a chunk's activations serves RPS times
+// the rows, and each row's weights are loaded once per group, before that staging, so their memory latency overlaps
+// it (the old path asked for them only after the staging's barrier).  Every row's sum is row_dot_20_sub16's: the same
+// loads, the same dp4a order, the same __fadd_rn and the same 8-4-2-1 butterfly, so the same bits.
+template<int RPS>
+__global__ void __launch_bounds__(256) native_down_q20_rows_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                   const int32_t* __restrict__ grp_start,
+                                                                   const int32_t* __restrict__ n_groups,
+                                                                   const int32_t* __restrict__ ent_dst,
+                                                                   const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                                   float* __restrict__ out) {
+    using S = Split<42>;
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
+    const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+    const int sw = threadIdx.x >> 4, t = threadIdx.x & 15;
+    const int r0 = blockIdx.x * (16 * RPS) + sw;                 // rows r0, r0 + 16, ... r0 + 16 (RPS - 1)
+    const int kbx0 = t / 2, iqs0 = t % 2;                        // k = t
+    const int kbx1 = (t + 16) / 2, iqs1 = (t + 16) % 2;          // k = t + 16 (lanes 0-3)
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        S::W w0[RPS], w1[RPS];
+#pragma unroll
+        for (int q = 0; q < RPS; ++q) {
+            const int r = r0 + 16 * q;
+            const uint8_t* wr = (const uint8_t*) grp_ptr[g] + L.down_off + (size_t) (r < L.n_embd ? r : 0) * L.d_row;
+            w0[q] = S::load(wr, kbx0, iqs0);
+            if (t < 4) w1[q] = S::load(wr, kbx1, iqs1);
+        }
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20);
+            const int words = n * (20 * 9);
+            __syncthreads();
+            for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
+            __syncthreads();
+#pragma unroll
+            for (int q = 0; q < RPS; ++q) {
+                const int r = r0 + 16 * q;
+                float s[GRP_NC];
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c) {
+                    s[c] = 0.0f;
+                    if (c < n) s[c] += S::apply(w0[q], s_hq + 20 * c + kbx0 * 2, iqs0);
+                }
+                float s16[GRP_NC];
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c) s16[c] = 0.0f;
+                if (t < 4) {
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (c < n) s16[c] += S::apply(w1[q], s_hq + 20 * c + kbx1 * 2, iqs1);
+                }
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c) {
+                    if (c < n) {
+                        s[c] = __fadd_rn(s[c], s16[c]);
+#pragma unroll
+                        for (int o = 8; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+                    }
+                }
+                if (r < L.n_embd) {
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (c < n && t == c) out[(size_t) ent_dst[e + c] * L.n_embd + r] = s[c];
+                }
+            }
+        }
+    }
+}
+bool g_down_r4 = env_on("STRATA_DOWN_R4");
 
 template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
@@ -2689,6 +2847,10 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_no_sub16_gu) native_down_multi_kernel<TD, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else if (TD == 42 && g_down_r4 && L.n_ff == 640 && L.n_embd % 64 == 0) {
+        const dim3 g4((unsigned) (L.n_embd / 64), grid.y);
+        native_down_q20_rows_kernel<4><<<g4, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    }
     else native_down_multi_kernel<TD, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
 
