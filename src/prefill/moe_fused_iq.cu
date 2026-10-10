@@ -683,32 +683,75 @@ __device__ __forceinline__ nw_i8 nw_wmma(nw_i4 a, nw_i4 b, nw_i8 c) {
 #endif
 }
 __device__ __forceinline__ nw_i4 nw_u4(uint4 v) { return nw_i4{(int) v.x, (int) v.y, (int) v.z, (int) v.w}; }
+// A workgroup barrier for LDS traffic only: s_waitcnt lgkmcnt(0) + s_barrier.  __syncthreads() is a workgroup-scope
+// fence on every address space, which on gfx11 also waits for the outstanding global loads (vmcnt(0)) - the activation
+// prefetch would have to land within one stage - and invalidates the L0 cache (buffer_gl0_inv) at every barrier.  The
+// kernel shares nothing through global memory inside a launch, so the LDS-only fence is all it needs.
+// the value of the lane 16 away (the other half of the wave): v_permlanex16 with the identity selectors, one VALU op
+// (__shfl_xor by 16 is a ds_bpermute, an LDS op)
+__device__ __forceinline__ float nw_swap16(float v) {
+    return __uint_as_float((unsigned) __builtin_amdgcn_permlanex16((int) __float_as_uint(v), (int) __float_as_uint(v),
+                                                                   0x76543210, 0xFEDCBA98, false, false));
+}
+__device__ __forceinline__ void nw_bar() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
 
 // W (X1): ALIAS = the H tile lives on the weight buffers (one extra barrier); LB > 0 = amdgpu_waves_per_eu(LB) (VGPR cap).
 // Disable both with -DSTRATA_W_NO_OCC (the launch sites then use <WT, GU, false, 0> and grid factor wgp_blocks).
 template <int WT, bool GU, bool ALIAS = false, int LB = 0>
 __global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
-native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
-                  const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
+native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* act,   // act, src: no __restrict__ (see fetch_b)
+                  const int32_t* src, uint8_t* __restrict__ out, float* __restrict__ dm, int dm16 = 0) {
 #if STRATA_NAT_W11
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;  // 64-value stages along K
-    constexpr int NFB = (GU ? 1280 : 2560) / NW_ROWS;     // work items per tile
+    constexpr int NFB = (GU ? 1280 : 2560) / NW_ROWS;     // work items per token tile
     constexpr int ACT_LD = NS * AB;
     constexpr int BS = block_bytes(WT);
     constexpr bool K16 = per16(WT);
     constexpr int GB = grid_bytes(WT) > 0 ? grid_bytes(WT) : 16;
-    __shared__ __align__(16) uint8_t wtbuf[2 * NW_ROWS * WLD];
-    uint8_t(*wt)[NW_ROWS][WLD] = reinterpret_cast<uint8_t(*)[NW_ROWS][WLD]>(wtbuf);
-    __shared__ __align__(16) float ws[2][NW_ROWS][4];           // their scales per 16 values
+    constexpr bool Q2 = WT == T_Q2_0;
+    // W (X3).  The token tile: TT routed rows of one expert per work item (two of the grouping's 64-row tiles for
+    // Q2_0: the weights of the item are decoded, and read from memory, once per 128 tokens instead of per 64; the
+    // formats with a codebook keep 64 so that three blocks still fit a WGP's LDS).  Items are enumerated per expert,
+    // ceil(rows / TT) of them, from a prefix sum over the launch's experts that each block builds in LDS.  Of the
+    // eight waves, four run along the weight rows (32 each) and two along the tokens (TT / 2 each, NTT 16-row tiles).
+    constexpr int TT = Q2 ? 128 : kTileRows;
+    constexpr int NTT = TT / 32;
+    constexpr int NP = (TT * (AB / 16) + NW_THREADS - 1) / NW_THREADS;   // activation pieces (16 bytes) a thread stages
+    constexpr int PIECES = TT * (AB / 16);
+    static_assert((PIECES - (NP - 1) * NW_THREADS & (PIECES - (NP - 1) * NW_THREADS - 1)) == 0, "the last pieces' count is a power of two (their duplicates' mask)");
+    // W (X2).  Q2_0's weight scale is one per 64 values - one per row and stage - and lives where its D lanes read it:
+    // ws2[buf][row / 16][hi][i] is the scale of row 16 (row / 16) + 2 i + hi, so lane (hi, l16) of a tile's WMMA reads
+    // its eight scales with two 16-byte loads (the other formats: ws[buf][row][4], per 16 values).
+    constexpr int WS_BYTES = Q2 ? NW_ROWS * 4 : NW_ROWS * 16;
+    constexpr int WT_BYTES = 2 * NW_ROWS * WLD, BT_BYTES = 2 * TT * AB;
+    // One arena: the decoded weights (double-buffered), the staged activations (double-buffered: a stage's TT rows x
+    // 80 bytes, in the global layout), the weight scales.  The activations come through LDS so that the four waves
+    // along the weight rows share one fetch, the fetch is two stages ahead with NP x 4 registers per thread in flight
+    // (not 36 per lane), and the fragments arrive by 16-byte LDS loads like the weights'.
+    __shared__ __align__(16) uint8_t arena[WT_BYTES + BT_BYTES + 2 * WS_BYTES];
+    uint8_t(*wt)[NW_ROWS][WLD] = reinterpret_cast<uint8_t(*)[NW_ROWS][WLD]>(arena);
+    uint8_t(*bt)[TT][AB] = reinterpret_cast<uint8_t(*)[TT][AB]>(arena + WT_BYTES);
+    float(*ws)[NW_ROWS][4] = reinterpret_cast<float(*)[NW_ROWS][4]>(arena + WT_BYTES + BT_BYTES);
+    float(*ws2)[NW_ROWS / 16][2][8] = reinterpret_cast<float(*)[NW_ROWS / 16][2][8]>(arena + WT_BYTES + BT_BYTES);
     __shared__ __align__(16) uint8_t sgrid[GB];
     constexpr int SGN = (WT == T_IQ2_XXS || WT == T_IQ2_XS || WT == T_IQ2_S || WT == T_IQ3_XXS || WT == T_IQ3_S)
                             ? sign_entries(WT) : 1;
     __shared__ __align__(16) uint4 ssign[SGN];                   // the signs of a sign byte, as byte masks
-    __shared__ int srow[kTileRows];
-    __shared__ float hs_sep[(GU && !ALIAS) ? kTileRows : 1][65];
-    static_assert(!ALIAS || (size_t) kTileRows * 65 * 4 <= (size_t) 2 * NW_ROWS * WLD, "H tile must fit the weight buffers");
-    float(*hs)[65] = ALIAS ? reinterpret_cast<float(*)[65]>(wtbuf) : hs_sep;
-    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    __shared__ int spre[kMaxBatch + 1];                          // items before expert e0 + i (prefix sum), spre[ne] = all
+    // the H tile of a gate/up item, on the arena once the stages are done with it: hs[token][HS_LD] (a lane's 16
+    // features are four 16-byte stores; 68 floats a row: 16-byte aligned, and 16 rows at a column spread over the
+    // banks), hm[wm][token] = max |h| over wave wm's 16 features
+    constexpr int HS_LD = 68;
+    static_assert((size_t) TT * HS_LD * 4 + 4 * TT * 4 <= (size_t) WT_BYTES + BT_BYTES, "H tile must fit the arena");
+    float(*hs)[HS_LD] = reinterpret_cast<float(*)[HS_LD]>(arena);
+    float(*hm)[TT] = reinterpret_cast<float(*)[TT]>(arena + TT * HS_LD * 4);
+    // the wave index is uniform (readfirstlane: the compiler does not know the wave size here), so the per-wave
+    // tile checks are scalar branches and the per-wave parts of the addresses live in scalar registers
+    const int tid = threadIdx.x, lane = tid & 31, wave = __builtin_amdgcn_readfirstlane(tid >> 5);
     const int wm = wave & 3, wn = wave >> 2, l16 = lane & 15, hi = lane >> 4;
     if constexpr (grid_bytes(WT) > 0) {
         const uint32_t* gs = (const uint32_t*) grid_src<WT>();
@@ -722,153 +765,309 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
 #pragma unroll
         for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
     }
+    // the items of the launch's experts: ceil(rows / TT) each (every thread sums the experts before its own: at most
+    // 128 LDS reads, once per block)
+    const int ne = b.e1 - b.e0;
+    if (tid <= ne) {
+        int s = 0;
+        for (int i = 0; i < tid; ++i) s += (tb.off[b.e0 + i + 1] - tb.off[b.e0 + i] + TT - 1) / TT;
+        spre[tid] = s;
+    }
+    nw_bar();
+    const int nwork = spre[ne] * NFB;
+    if ((int) blockIdx.x >= nwork) return;
     const int ur = tid >> 1, uj = tid & 1;                       // this thread's decode unit: row ur, sub-block uj
-    const int t0 = tb.ts[b.e0], nwork = (tb.ts[b.e1] - t0) * NFB;
-    for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
-        const int2 tl = tb.tiles[t0 + w / NFB];
-        const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(kTileRows, tb.off[e + 1] - row0);
-        const uint8_t* blob = b.blob[e - b.e0];
-        const int rbase = fb * NW_ROWS;
-        const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
-                                 : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
-        auto unit = [&](int s) -> const uint8_t* {
-            if (GU) return wrow + (s >> 2) * BS;
-            return (WT == T_IQ4_NL || WT == T_Q5_1 || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
-        };
-        auto sub = [&](int s) { return GU ? 2 * (s & 3) + uj : uj; };
-        auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
-            uint32_t q[8];
-            float s0, s1;
-            convert<WT>(raw, sgrid, kv, q, s0, s1, ssign);
-            uint4* d = (uint4*) &wt[buf][ur][32 * uj];
-            d[0] = make_uint4(q[0], q[1], q[2], q[3]);
-            d[1] = make_uint4(q[4], q[5], q[6], q[7]);
-            *(float2*) &ws[buf][ur][2 * uj] = make_float2(s0, s1);
-        };
-        __syncthreads();                                          // the previous item is done with the buffers
-        if (tid < kTileRows) {
-            const int r = row0 + min(tid, nrows - 1);             // rows past the tile's end repeat its last one
-            srow[tid] = GU ? src[r] : r;
-        }
-        uint32_t raw[raw_words(WT)] = {};
-        load_unit<WT>(unit(0), sub(0), raw);
-        put(raw, 0);
-        if (NS > 1) load_unit<WT>(unit(1), sub(1), raw);
-        __syncthreads();                                          // srow
-        const bool on = 32 * wn < nrows;
-        const uint8_t* brow[2];
+    // this thread's activation pieces: pieces tid, tid + 256, ... (the last one duplicated for the threads past the
+    // end: the loads are unconditional, only the stores are not)
+    int bp[3] = {0, 0, 0}, btk[3] = {0, 0, 0};
+    bool live[3] = {false, false, false};
 #pragma unroll
-        for (int nt = 0; nt < 2; ++nt) brow[nt] = act + (size_t) srow[32 * wn + 16 * nt + l16] * ACT_LD;
-        float acc[2][2][8];
+    for (int q = 0; q < NP; ++q) {
+        const int first = q * NW_THREADS;
+        live[q] = first + tid < PIECES;
+        bp[q] = first + (live[q] ? tid : (tid & (PIECES - first - 1)));
+        btk[q] = bp[q] / 5;
+    }
+    // A work item: its tile and rows, this thread's weight row and the sources of its activation pieces (rows past
+    // the tile's end repeat its last one).  The pipeline runs across items: the last two stages of an item fetch the
+    // next item's first two stages (see `stage`), and the item's description - the expert (a search of spre, LDS),
+    // its row range (two loads), (gate/up) the routing of this thread's rows (loads) - runs one level per item ahead
+    // of that, so no load of it is waited for (a wait for a late load drains every load in flight: the counter is in
+    // order).
+    struct Item {
+        int fb, row0, nrows;
+        const uint8_t* wrow;
+        uint32_t boff0, boff1, boff2;   // this thread's pieces: byte offsets into act (32-bit: fewer registers)
+    };
+    // uniform values that arrive in vector registers (LDS / vector loads) go to scalar ones
+    auto uni = [](int v) { return __builtin_amdgcn_readfirstlane(v); };
+    const int grid = (int) gridDim.x;
+    auto item_of = [&](int k) { return min((int) blockIdx.x + k * grid, nwork - 1); };   // the k-th item after the first
+    auto expert_of = [&](int w, int& ei, int& j) {   // the item's expert (index in the launch) and its tile in it
+        const int p = w / NFB;
+        int lo = 0;
+#pragma unroll
+        for (int step = kMaxBatch; step > 0; step >>= 1)
+            if (lo + step < ne && spre[lo + step] <= p) lo += step;
+        ei = uni(lo);
+        j = uni(p - spre[lo]);
+    };
+    auto range_of = [&](int ei, int& oa, int& ob) {
+        oa = uni(tb.off[b.e0 + ei]);
+        ob = uni(tb.off[b.e0 + ei + 1]);
+    };
+    auto rows_of = [&](int j, int oa, int ob, int (&sr)[NP]) {   // this thread's activation rows
+        const int row0 = oa + j * TT, nrows = min(TT, ob - row0);
+#pragma unroll
+        for (int q = 0; q < NP; ++q) {
+            const int r = row0 + min(btk[q], nrows - 1);
+            sr[q] = GU ? src[r] : r;
+        }
+    };
+    auto finish = [&](int w, int ei, int j, int oa, int ob, const int (&sr)[NP]) -> Item {
+        Item it;
+        it.fb = uni(w % NFB);
+        it.row0 = uni(oa + j * TT);
+        it.nrows = uni(min(TT, ob - it.row0));
+        const uint8_t* blob = b.blob[ei];
+        it.wrow = GU ? blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (it.fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
+                     : blob + geo.down_off + (size_t) (it.fb * NW_ROWS + ur) * geo.d_row;
+        it.boff0 = (uint32_t) sr[0] * ACT_LD + (bp[0] % 5) * 16;
+        it.boff1 = (uint32_t) sr[1] * ACT_LD + (bp[1] % 5) * 16;
+        it.boff2 = NP > 2 ? (uint32_t) sr[NP - 1] * ACT_LD + (bp[NP - 1] % 5) * 16 : 0u;
+        return it;
+    };
+    // gate/up: a 256-value super-block covers four stages (sub-blocks 0..7), except Q2_0, whose 64-value block is
+    // one stage (sub-blocks 0..1), as in its down rows
+    auto unit = [&](const Item& it, int s) -> const uint8_t* {
+        if (GU) return WT == T_Q2_0 ? it.wrow + s * BS : it.wrow + (s >> 2) * BS;
+        return (WT == T_IQ4_NL || WT == T_Q5_1 || WT == T_Q8_0) ? it.wrow + (2 * s + uj) * BS : it.wrow + s * BS;
+    };
+    auto sub = [&](int s) { return GU && WT != T_Q2_0 ? 2 * (s & 3) + uj : uj; };
+    auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
+        uint32_t q[8];
+        float s0, s1;
+        convert<WT>(raw, sgrid, kv, q, s0, s1, ssign);
+        uint4* d = (uint4*) &wt[buf][ur][32 * uj];
+        d[0] = make_uint4(q[0], q[1], q[2], q[3]);
+        d[1] = make_uint4(q[4], q[5], q[6], q[7]);
+        if constexpr (Q2) {
+            if (uj == 0) ws2[buf][ur >> 4][ur & 1][(ur & 15) >> 1] = s0;
+        } else {
+            *(float2*) &ws[buf][ur][2 * uj] = make_float2(s0, s1);
+        }
+    };
+    // The activation pieces.  The loads are unconditional, because a load inside a branch, or a register move of a
+    // load's destination, makes the compiler wait for every load in flight (s_waitcnt vmcnt(0)) - the prefetch
+    // distance would be gone.  For the same reason the stage loop is unrolled by two, the two register sets
+    // alternating, with the last two stages peeled; and `act` / `src` are not __restrict__: an invariant load may be
+    // sunk to its use (two stages later) past any compiler barrier.
+    // (named registers, not arrays: an array of pieces handed around by reference ended up in scratch memory)
+    auto fetch_b = [&](const Item& it, int s, uint4& p0, uint4& p1, uint4& p2) {
+        p0 = *reinterpret_cast<const uint4*>(act + it.boff0 + s * AB);
+        p1 = *reinterpret_cast<const uint4*>(act + it.boff1 + s * AB);
+        if constexpr (NP > 2) p2 = *reinterpret_cast<const uint4*>(act + it.boff2 + s * AB);
+    };
+    auto store_b = [&](int buf, const uint4& p0, const uint4& p1, const uint4& p2) {
+        *reinterpret_cast<uint4*>(&bt[buf][0][0] + 16 * bp[0]) = p0;
+        if (live[1]) *reinterpret_cast<uint4*>(&bt[buf][0][0] + 16 * bp[1]) = p1;
+        if constexpr (NP > 2) if (live[2]) *reinterpret_cast<uint4*>(&bt[buf][0][0] + 16 * bp[2]) = p2;
+    };
+    // the description pipeline's state at an item's top: the expert / tile of items +1, +2, +3, the row range of +1,
+    // +2, the rows of +1 (the first item's own description is resolved here, once per block)
+    int ei1, j1, ei2, j2, ei3, j3, oa1, ob1, oa2, ob2;
+    int sr1[NP];
+    expert_of(item_of(1), ei1, j1);
+    expert_of(item_of(2), ei2, j2);
+    expert_of(item_of(3), ei3, j3);
+    range_of(ei1, oa1, ob1);
+    range_of(ei2, oa2, ob2);
+    rows_of(j1, oa1, ob1, sr1);
+    Item cur;
+    {
+        int ei0, j0, oa0, ob0, sr0[NP];
+        expert_of(item_of(0), ei0, j0);
+        range_of(ei0, oa0, ob0);
+        rows_of(j0, oa0, ob0, sr0);
+        cur = finish(item_of(0), ei0, j0, oa0, ob0, sr0);
+    }
+    // the WMMA bias (the C operand; see MAGIC) in eight registers for the whole kernel: at the register limit the
+    // compiler re-materializes it before most chains instead (eight moves each) - an opaque asm pins it
+    nw_i8 m;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) asm volatile("v_mov_b32 %0, 0x4b400000" : "=v"(m[i]));
+    // in flight across the stages: raw0 = the next item's stage-0 weights, raw = the stage after the next one's;
+    // ra / rc = two sets of activation pieces (stage s + 1 and s + 2)
+    uint32_t raw[raw_words(WT)] = {}, raw0[raw_words(WT)] = {};
+    uint4 ra0, ra1, ra2, rc0, rc1, rc2;
+    load_unit<WT>(unit(cur, 0), sub(0), raw0);
+    fetch_b(cur, 0, ra0, ra1, ra2);
+    fetch_b(cur, 1, rc0, rc1, rc2);
+    load_unit<WT>(unit(cur, 1), sub(1), raw);
+    for (int k = 0, w = blockIdx.x; w < nwork; ++k, w += grid) {
+        // the description pipeline: the expert of item +4, the row range of +3, the rows of +2; item +1 is complete
+        int ei4, j4, oa3, ob3, sr2[NP];
+        expert_of(item_of(k + 4), ei4, j4);
+        range_of(ei3, oa3, ob3);
+        rows_of(j2, oa2, ob2, sr2);
+        asm volatile("" ::: "memory");                           // these loads stay here, not at their use
+        const Item nxt = finish(item_of(k + 1), ei1, j1, oa1, ob1, sr1);
+        const int fb = cur.fb, row0 = cur.row0, nrows = cur.nrows, rbase = fb * NW_ROWS;
+        nw_bar();                                                 // the previous item is done with the arena
+        put(raw0, 0);
+        store_b(0, ra0, ra1, ra2);
+        bool on_nt[NTT];                                          // this wave's 16-row token tiles with rows
+#pragma unroll
+        for (int nt = 0; nt < NTT; ++nt) on_nt[nt] = (TT / 2) * wn + 16 * nt < nrows;
+        const bool on = on_nt[0];
+        float acc[2][NTT][8];
 #pragma unroll
         for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt)
+            for (int nt = 0; nt < NTT; ++nt)
 #pragma unroll
                 for (int i = 0; i < 8; ++i) acc[mt][nt][i] = 0.0f;
-        uint4 bq[2][4];
-        float2 bx[2], bsum[2];   // the activation scales, and (the formats with a minimum) the codes' sums per 32 values
-        auto fetch_b = [&](int s, uint4 (&q)[2][4], float2 (&x)[2], float2 (&sm)[2]) {
-#pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
-                const uint4* p = reinterpret_cast<const uint4*>(brow[nt] + s * AB);
-                q[nt][0] = p[0]; q[nt][1] = p[1]; q[nt][2] = p[2]; q[nt][3] = p[3];
-                x[nt] = *reinterpret_cast<const float2*>(brow[nt] + s * AB + 64);
-                if constexpr (has_min(WT)) sm[nt] = *reinterpret_cast<const float2*>(brow[nt] + s * AB + 72);
-                else sm[nt] = make_float2(0.0f, 0.0f);
-            }
-        };
-        if (on) fetch_b(0, bq, bx, bsum);
-        for (int s = 0; s < NS; ++s) {
-            __syncthreads();                                      // stage s's weights are in buffer s & 1
-            uint4 nbq[2][4];
-            float2 nbx[2], nbsum[2];
-            if (on && s + 1 < NS) fetch_b(s + 1, nbq, nbx, nbsum);
+        // Stage s: its weights and activations are in buffers s & 1.  It fetches two stages ahead into nb (mode 0:
+        // stage s + 2; 1: the next item's stage 0; 2: its stage 1), computes, and decodes / stores stage s + 1 (sa)
+        // into the other buffers, whose readers (stage s - 1) passed this stage's barrier.
+        auto stage = [&](int s, uint4& sa0, uint4& sa1, uint4& sa2, uint4& nb0, uint4& nb1, uint4& nb2, int mode) {
+            nw_bar();
+            if (mode == 0) fetch_b(cur, s + 2, nb0, nb1, nb2);
+            else fetch_b(nxt, mode - 1, nb0, nb1, nb2);
+            asm volatile("" ::: "memory");                       // keep the loads here (the compiler sinks them to their use otherwise)
             if (on) {
                 const int bf = s & 1;
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
+                for (int mt = 0; mt < 2; ++mt) {
+                    const int rb = 32 * wm + 16 * mt;
+                    nw_i4 A[2][2];                                // [h][k16]
 #pragma unroll
-                    for (int mt = 0; mt < 2; ++mt) {
-                        const int rb = 32 * wm + 16 * mt;
+                    for (int h = 0; h < 2; ++h) {
                         const uint4* ap = reinterpret_cast<const uint4*>(&wt[bf][rb + l16][32 * h]);
-                        const nw_i4 A0 = nw_u4(ap[0]), A1 = nw_u4(ap[1]);
-                        float w0[8], w1[8];
+                        A[h][0] = nw_u4(ap[0]);
+                        A[h][1] = nw_u4(ap[1]);
+                    }
+                    float w0[2][8], w1[2][8];                     // [h][i]: the scales of rows rb + 2 i + hi
+                    if constexpr (Q2) {
+                        const float4* sp = reinterpret_cast<const float4*>(&ws2[bf][rb / 16][hi][0]);
+                        const float4 sa4 = sp[0], sb4 = sp[1];
+                        w0[0][0] = sa4.x; w0[0][1] = sa4.y; w0[0][2] = sa4.z; w0[0][3] = sa4.w;
+                        w0[0][4] = sb4.x; w0[0][5] = sb4.y; w0[0][6] = sb4.z; w0[0][7] = sb4.w;
+                    } else {
 #pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            const float2 sw = *reinterpret_cast<const float2*>(&ws[bf][rb + 2 * i + hi][2 * h]);
-                            w0[i] = sw.x; w1[i] = sw.y;
-                        }
+                        for (int h = 0; h < 2; ++h)
 #pragma unroll
-                        for (int nt = 0; nt < 2; ++nt) {
-                            const float dx = h ? bx[nt].y : bx[nt].x;
-                            const nw_i4 B0 = nw_u4(bq[nt][2 * h]), B1 = nw_u4(bq[nt][2 * h + 1]);
-                            const nw_i8 m = nw_i8{MAGIC, MAGIC, MAGIC, MAGIC, MAGIC, MAGIC, MAGIC, MAGIC};
-                            if constexpr (K16) {
-                                const nw_i8 d0 = nw_wmma(A0, B0, m), d1 = nw_wmma(A1, B1, m);
+                            for (int i = 0; i < 8; ++i) {
+                                const float2 sw = *reinterpret_cast<const float2*>(&ws[bf][rb + 2 * i + hi][2 * h]);
+                                w0[h][i] = sw.x; w1[h][i] = sw.y;
+                            }
+                    }
+                    // the token tiles' operands are read one tile at a time (all of them at once would hold NTT x
+                    // (4 x 4 + 2) registers across the WMMAs)
 #pragma unroll
-                                for (int i = 0; i < 8; ++i) {
-                                    const float v = fmaf(w1[i], dotf(d1[i]), w0[i] * dotf(d0[i]));
-                                    acc[mt][nt][i] = fmaf(dx, v, acc[mt][nt][i]);
-                                }
-                            } else {
-                                const nw_i8 d = nw_wmma(A1, B1, nw_wmma(A0, B0, m));
+                    for (int nt = 0; nt < NTT; ++nt) {
+                        if (nt > 0 && !on_nt[nt]) continue;
+                        const uint8_t* br = &bt[bf][(TT / 2) * wn + 16 * nt + l16][0];
+                        const float2 bx = *reinterpret_cast<const float2*>(br + 64);
+                        float2 bsum = make_float2(0.0f, 0.0f);
+                        if constexpr (has_min(WT)) bsum = *reinterpret_cast<const float2*>(br + 72);
+                        if constexpr (Q2) {
+                            // one weight scale for both halves: acc += w (dx0 dot0 + dx1 dot1)
+                            const uint4* bp4 = reinterpret_cast<const uint4*>(br);
+                            const nw_i8 d0 = nw_wmma(A[0][1], nw_u4(bp4[1]), nw_wmma(A[0][0], nw_u4(bp4[0]), m));
+                            const nw_i8 d1 = nw_wmma(A[1][1], nw_u4(bp4[3]), nw_wmma(A[1][0], nw_u4(bp4[2]), m));
 #pragma unroll
-                                for (int i = 0; i < 8; ++i) {
-                                    acc[mt][nt][i] = fmaf(w0[i] * dx, dotf(d[i]), acc[mt][nt][i]);
-                                    if constexpr (has_min(WT)) acc[mt][nt][i] = fmaf(w1[i] * dx, h ? bsum[nt].y : bsum[nt].x, acc[mt][nt][i]);
+                            for (int i = 0; i < 8; ++i) {
+                                const float v = fmaf(bx.y, dotf(d1[i]), bx.x * dotf(d0[i]));
+                                acc[mt][nt][i] = fmaf(w0[0][i], v, acc[mt][nt][i]);
+                            }
+                        } else {
+#pragma unroll
+                            for (int h = 0; h < 2; ++h) {
+                                const float dx = h ? bx.y : bx.x;
+                                const uint4* bp4 = reinterpret_cast<const uint4*>(br + 32 * h);
+                                const nw_i4 B0 = nw_u4(bp4[0]), B1 = nw_u4(bp4[1]);
+                                if constexpr (K16) {
+                                    const nw_i8 d0 = nw_wmma(A[h][0], B0, m), d1 = nw_wmma(A[h][1], B1, m);
+#pragma unroll
+                                    for (int i = 0; i < 8; ++i) {
+                                        const float v = fmaf(w1[h][i], dotf(d1[i]), w0[h][i] * dotf(d0[i]));
+                                        acc[mt][nt][i] = fmaf(dx, v, acc[mt][nt][i]);
+                                    }
+                                } else {
+                                    const nw_i8 d = nw_wmma(A[h][1], B1, nw_wmma(A[h][0], B0, m));
+#pragma unroll
+                                    for (int i = 0; i < 8; ++i) {
+                                        acc[mt][nt][i] = fmaf(w0[h][i] * dx, dotf(d[i]), acc[mt][nt][i]);
+                                        if constexpr (has_min(WT)) acc[mt][nt][i] = fmaf(w1[h][i] * dx, h ? bsum.y : bsum.x, acc[mt][nt][i]);
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            if (s + 1 < NS) {
-                put(raw, (s + 1) & 1);                            // the other buffer: its readers passed this barrier
-                __syncthreads();                                      // the writes of every thread are in LDS before the next stage reads them (#1180)
-                if (s + 2 < NS) load_unit<WT>(unit(s + 2), sub(s + 2), raw);
-                if (on) {
+            if (mode != 2) {
+                put(raw, (s + 1) & 1);
+                store_b((s + 1) & 1, sa0, sa1, sa2);
+            }
+            if (mode == 0) load_unit<WT>(unit(cur, s + 2), sub(s + 2), raw);
+            else if (mode == 1) load_unit<WT>(unit(nxt, 0), sub(0), raw0);
+            else load_unit<WT>(unit(nxt, 1), sub(1), raw);
+        };
+        static_assert(NS % 2 == 0 && NS >= 4, "the stage loop is unrolled by two with the last two stages peeled");
+        for (int s = 0; s + 3 < NS; s += 2) {
+            stage(s, rc0, rc1, rc2, ra0, ra1, ra2, 0);
+            stage(s + 1, ra0, ra1, ra2, rc0, rc1, rc2, 0);
+        }
+        stage(NS - 2, rc0, rc1, rc2, ra0, ra1, ra2, 1);
+        stage(NS - 1, ra0, ra1, ra2, rc0, rc1, rc2, 2);
+        if constexpr (GU) {
+            nw_bar();                                      // every wave is done reading the arena
+            if (on) {
 #pragma unroll
-                    for (int nt = 0; nt < 2; ++nt) {
-                        bx[nt] = nbx[nt];
-                        bsum[nt] = nbsum[nt];
+                for (int nt = 0; nt < NTT; ++nt) {
+                    if (nt > 0 && !on_nt[nt]) continue;
+                    // lane (hi = 0, l16) holds the gate rows of its 16 features at token (TT / 2) wn + 16 nt + l16,
+                    // its partner lane (hi = 1) the up rows: h = silu(gate) up, and the lane's max |h|
+                    float h[16], am = 0.0f;
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) bq[nt][j] = nbq[nt][j];
+                    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const float gt = acc[mt][nt][i], up = nw_swap16(gt);
+                            const float v = gt * __builtin_amdgcn_rcpf(1.0f + __expf(-gt)) * up;
+                            h[8 * mt + i] = v;
+                            am = fmaxf(am, fabsf(v));
+                        }
+                    if (hi == 0) {
+                        const int r = (TT / 2) * wn + 16 * nt + l16;
+                        float4* p = reinterpret_cast<float4*>(&hs[r][16 * wm]);
+#pragma unroll
+                        for (int c = 0; c < 4; ++c) p[c] = make_float4(h[4 * c], h[4 * c + 1], h[4 * c + 2], h[4 * c + 3]);
+                        hm[wm][r] = am;
                     }
                 }
             }
-        }
-        if constexpr (GU) {
-            if constexpr (ALIAS) __syncthreads();                 // every wave is done reading the weight buffers
-            if (on) {
-#pragma unroll
-                for (int mt = 0; mt < 2; ++mt)
-#pragma unroll
-                    for (int nt = 0; nt < 2; ++nt)
-#pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            const float up = __shfl_xor_sync(0xffffffffu, acc[mt][nt][i], 16);
-                            const float gt = acc[mt][nt][i];
-                            if (hi == 0) hs[32 * wn + 16 * nt + l16][16 * wm + 8 * mt + i] = gt / (1.0f + __expf(-gt)) * up;
-                        }
-            }
-            __syncthreads();
-            // H block fb (features 64 fb ..) to int8 per 32, natural order: a thread per (tile row, half)
-            if (tid < 2 * kTileRows) {
-                const int r = tid >> 1, hh = tid & 1;
+            nw_bar();
+            // H block fb (features 64 fb ..) to int8 per 32, natural order: a thread per (token, half)
+            if (tid < 2 * TT) {
+                const int r = tid & (TT - 1), hh = tid / TT;
                 if (r < nrows) {
-                    float am = 0.0f;
-#pragma unroll 8
-                    for (int j = 0; j < 32; ++j) am = fmaxf(am, fabsf(hs[r][32 * hh + j]));
+                    const float am = fmaxf(hm[2 * hh][r], hm[2 * hh + 1][r]);
                     const float inv = am > 0.0f ? 127.0f / am : 0.0f;
                     uint8_t* o = out + (size_t) (row0 + r) * (10 * AB) + (size_t) fb * AB;
-                    uint32_t wd[8] = {};
+                    const float4* hp = reinterpret_cast<const float4*>(&hs[r][32 * hh]);
+                    uint32_t wd[8];
                     int csum = 0;
 #pragma unroll
-                    for (int j = 0; j < 32; ++j) {
-                        const int c = __float2int_rn(hs[r][32 * hh + j] * inv);
-                        csum += c;
-                        wd[j >> 2] |= (uint32_t) (uint8_t) (int8_t) c << (8 * (j & 3));
+                    for (int j = 0; j < 8; ++j) {
+                        const float4 v = hp[j];
+                        const int c0 = __float2int_rn(v.x * inv), c1 = __float2int_rn(v.y * inv),
+                                  c2 = __float2int_rn(v.z * inv), c3 = __float2int_rn(v.w * inv);
+                        csum += c0 + c1 + c2 + c3;
+                        wd[j] = (uint32_t) (uint8_t) (int8_t) c0 | ((uint32_t) (uint8_t) (int8_t) c1 << 8) |
+                                ((uint32_t) (uint8_t) (int8_t) c2 << 16) | ((uint32_t) (uint8_t) (int8_t) c3 << 24);
                     }
                     uint4* o4 = reinterpret_cast<uint4*>(o + 32 * hh);
                     o4[0] = make_uint4(wd[0], wd[1], wd[2], wd[3]);
@@ -882,16 +1081,30 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
-                    for (int nt = 0; nt < 2; ++nt) {
-                        const int r = 32 * wn + 16 * nt + l16;
+                    for (int nt = 0; nt < NTT; ++nt) {
+                        const int r = (TT / 2) * wn + 16 * nt + l16;
                         if (r < nrows) {
-                            float* d = dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + hi;
+                            const size_t at = (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + hi;
+                            if (dm16) {   // STRATA_DM_F16: FP16, clamped to its range (the combine reads half the bytes)
+                                uint16_t* d = reinterpret_cast<uint16_t*>(dm) + at;
 #pragma unroll
-                            for (int i = 0; i < 8; ++i) d[2 * i] = acc[mt][nt][i];
+                                for (int i = 0; i < 8; ++i)
+                                    d[2 * i] = __builtin_bit_cast(uint16_t, (_Float16) fminf(fmaxf(acc[mt][nt][i], -65504.0f), 65504.0f));
+                            } else {
+                                float* d = dm + at;
+#pragma unroll
+                                for (int i = 0; i < 8; ++i) d[2 * i] = acc[mt][nt][i];
+                            }
                         }
                     }
             }
         }
+        cur = nxt;
+        ei1 = ei2; j1 = j2; oa1 = oa2; ob1 = ob2;
+#pragma unroll
+        for (int q = 0; q < NP; ++q) sr1[q] = sr2[q];
+        ei2 = ei3; j2 = j3; oa2 = oa3; ob2 = ob3;
+        ei3 = ei4; j3 = j4;
     }
 #else
     __builtin_trap();
@@ -997,6 +1210,7 @@ bool gu_covered(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS
 #if defined(__HIPCC__)
            || ((t == T_Q4_K || t == T_Q5_K) && kq_on())   // the gfx11 kernels only
+           || t == T_Q2_0                                 // the gfx11 kernels only: a native Q2_0 pack (gate/up)
 #endif
         ;
 }
@@ -1051,8 +1265,9 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 }
 
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
-                    const int32_t* src, void* ha, float* dm, void* stream) {
+                    const int32_t* src, void* ha, float* dm, void* stream, bool dm16) {
     if (b.e1 <= b.e0 || n <= 0) return;
+    const int dm16i = dm16 ? 1 : 0;
     const DevInfo& d = dev_info();
     if (!d.ok || !gu_covered(g.gu_type) || !d_covered(g.d_type)) {
         std::fprintf(stderr, "prefill fused experts (native): types %d / %d are not covered here\n", g.gu_type, g.d_type);
@@ -1070,7 +1285,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         const bool occ_gu = false, occ_d = false;
 #else
         const bool occ_gu = g.gu_type == T_IQ2_XXS || g.gu_type == T_IQ2_XS || g.gu_type == T_IQ2_S ||
-                            g.gu_type == T_IQ3_XXS || g.gu_type == T_IQ3_S || g.gu_type == T_IQ4_XS;
+                            g.gu_type == T_IQ3_XXS || g.gu_type == T_IQ3_S || g.gu_type == T_IQ4_XS || g.gu_type == T_Q2_0;
         const bool occ_d = g.d_type == T_Q2_0 || g.d_type == T_Q8_0 || g.d_type == T_IQ4_NL;
 #endif
         const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (1280 / NW_ROWS), (int64_t) d.sms * (occ_gu ? 4 : wgp_blocks(d.occ)));
@@ -1086,10 +1301,11 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             case T_IQ3_S: STRATA_NW_GU(T_IQ3_S); break;
             case T_Q4_K: STRATA_NW_GU(T_Q4_K); break;
             case T_Q5_K: STRATA_NW_GU(T_Q5_K); break;
+            case T_Q2_0: STRATA_NW_GU(T_Q2_0); break;
             default: STRATA_NW_GU(T_IQ4_XS); break;
         }
 #undef STRATA_NW_GU
-#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
+#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm, dm16i); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm, dm16i); } while (0)
         if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
         else if (g.d_type == T_Q5_1) STRATA_NW_D(T_Q5_1);
         else if (g.d_type == T_Q8_0) STRATA_NW_D(T_Q8_0);

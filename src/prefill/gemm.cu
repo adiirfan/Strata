@@ -682,8 +682,15 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 }
 
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+// a padded X (row stride ldx > K) widened row by row into the MMQ's contiguous FP32 rows (the same values as the
+// contiguous copy: FP16 -> FP32 is exact)
+__global__ void f16_to_f32_rows_kernel(const uint16_t* __restrict__ x, int64_t ldx, float* __restrict__ y, int64_t K,
+                                       int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __half2float(__ushort_as_half(x[(i / K) * ldx + i % K]));
+}
 bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int64_t T, int64_t N, int64_t K,
-                      int64_t ldy) {
+                      int64_t ldy, int64_t ldx) {
     namespace mmq = strata::prefill::mmq;
     constexpr int64_t kRows = 1024, kMaxK = 8192;
     static const bool enabled = [] {
@@ -725,7 +732,10 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
 
     for (int64_t r0 = 0; r0 < T; r0 += R) {
         const int64_t rows = (T - r0 < R) ? T - r0 : R;
-        mmq::f16_to_f32(X + r0 * K, xf, rows * K, stream_);
+        if (ldx > K)
+            f16_to_f32_rows_kernel<<<(unsigned) ((rows * K + 255) / 256), 256, 0, (cudaStream_t) stream_>>>(
+                X + r0 * ldx, ldx, xf, K, rows * K);
+        else mmq::f16_to_f32(X + r0 * K, xf, rows * K, stream_);
         mmq::quantize(xf, nullptr, xq, type, K, K, rows, stream_);
         mmq::set_bounds(bounds, (int32_t) rows, stream_);
         mmq::Product p;
@@ -788,6 +798,10 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     }
 #endif
     if (ldx > 0 && ldx != K) {
+#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+        // the dense MMQ (STRATA_DENSE_MMQ=1) reads a padded X too: the products it gave before X was padded
+        if (beta == 0.0f && ldx > K && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy, ldx)) return;
+#endif
 #ifdef STRATA_USE_HIP
         // X arrived padded but the weight cannot be (an i-quant without a strided dequant, or the scratch is too
         // small for N x (K + 64)): the weight unpadded, X read at its stride - the same products, the same bits

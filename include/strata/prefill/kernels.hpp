@@ -22,13 +22,14 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
                 uint16_t* xn16_lo = nullptr, int64_t ldx = 0);   // ldx: xn16's token stride (0 = 10240)
 /// gr_mix with xn recomputed from R, rs and w_norm exactly as gr_norm computes it (the same bits).
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
-              int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
+              int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr,
+              int64_t ld_h = 0);   // ld_h: mixed_h's row stride (0 = 2560)
 /// F-2: gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just written - the same bits as
 /// the two calls, without reading R back.
 /// S23 (opt-in STRATA_HC_UPMIX=1): the up projection (lo16 x w_up^T, BF16, FP32 accumulate) with gr_mix_r as its
 /// epilogue - `gated` is never written.  False (nothing launched) off gfx11.
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
-              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream);
+              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream, int64_t ld_h = 0);
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr,
                       int64_t ldx = 0);
@@ -44,7 +45,7 @@ void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t*
 void set_act_f16(bool on);
 /// mixed[t, d] = mean_c xn[t, c, d] * sigmoid(gated[t, c, d]); FP32, BF16 and FP16 (either image may be null).
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
-            uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
+            uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr, int64_t ld_h = 0);
 /// R[t, c, d] += bo[t, d] * 2 sigmoid(inj[t, c] / hc)   (inj has row stride inj_ld)
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream);
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).
@@ -83,11 +84,15 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 /// dst[0, n) = src[0, n) in 16-byte loads (both 16-byte aligned; src may be mapped host memory: read over PCIe by
 /// the kernel, not queued on a copy engine).
 void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream);
-/// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
-void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
+/// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16; x16's rows at stride ld, 0 = width).
+void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream,
+                   int64_t ld = 0);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+/// moe_combine over FP16 rows (STRATA_DM_F16=1: the fused down kernel's output at half the bytes)
+void moe_combine_h(const uint16_t* D16, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                   float* bo, int64_t T, void* stream);
 /// --peer-device's prompt share as sums: bo[t, :] = (sum over the k with slot[t, k] < rows_local of w[t, k] *
 /// D[slot[t, k], :], in k order) + peer[t, :] + shared[t, :] * sigmoid(sg[t]).  `peer` (the peer's per-token sums)
 /// may be mapped host memory.

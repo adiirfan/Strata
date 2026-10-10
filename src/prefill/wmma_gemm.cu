@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 // src/prefill/wmma_gemm.cu - RDNA3 WMMA FP16 & BF16 GEMM for Strata prefill (gfx1100).
 //
 // Computes Y[t, n] = beta * Y[t, n] + sum_k W[n, k] * X[t, k] using RDNA3 WMMA intrinsics:
@@ -390,23 +392,20 @@ __global__ void __launch_bounds__(256) kernel(const _Float16* __restrict__ X, co
         }
 #endif
 }
-// The 128 x 256 kernel with a 64-k LDS tile (single buffer, the next tile in 12 named staging registers, 2 barriers
+// The 128 x 256 tile with a 64-k LDS tile (single buffer, the next tile in 12 named staging registers, 2 barriers
 // per tile: half the loop trips and barriers per k of the BK 32 double buffer). Each accumulator takes the same
 // WMMAs in the same k order as `kernel`: the same bits (s23/gemm_probe11.hip, memcmp). gfx1151, M 16384, both
 // operands padded: 38.0 -> 41.3 TFLOPS (N 2560 K 6144), 38.9 -> 40.9 (N 12288 K 2560), 40.3 -> 40.4 (N 10240).
-// K a multiple of 64.
-__global__ void __launch_bounds__(256) kernel_bk64(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
-                                                   float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
-                                                   int ldx, int ldw) {
+// K a multiple of 64.  Output tile (m0, n0): kernel_bk64 does one per block, kernel_bk64p loops over them.
+__device__ __forceinline__ void bk64_tile(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
+                                          float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
+                                          int ldx, int ldw, int m0, int n0) {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int BN = 256, WN = 64, BK64 = 64, LDK64 = BK64 + 8;
     __shared__ __align__(16) _Float16 sA[BM][LDK64];
     __shared__ __align__(16) _Float16 sB[BN][LDK64];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
     const int wm = wave & 1, wn = wave >> 1;
-    const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN, b = blockIdx.x;
-    const int group = b / (GM * num_n), first_m = group * GM, gsize = min(GM, num_m - first_m);
-    const int m0 = (first_m + (b % (GM * num_n)) % gsize) * BM, n0 = ((b % (GM * num_n)) / gsize) * BN;
     const int sr = tid >> 3, sq = tid & 7;            // 32 rows per pass, 8 x 8 halves per row
     auto ldA = [&](int k0, int r) -> uint4 {
         return *reinterpret_cast<const uint4*>(X + (size_t) min(m0 + r, M - 1) * ldx + k0 + 8 * sq);
@@ -476,6 +475,39 @@ __global__ void __launch_bounds__(256) kernel_bk64(const _Float16* __restrict__ 
             }
         }
 #endif
+}
+// the grouped tile order: GM row tiles sweep all column tiles (the weights stream from DRAM once per group)
+__device__ __forceinline__ void bk64_tile_of(int b, int M, int N, int& m0, int& n0) {
+    constexpr int BN = 256;
+    const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN;
+    const int group = b / (GM * num_n), first_m = group * GM, gsize = min(GM, num_m - first_m);
+    m0 = (first_m + (b % (GM * num_n)) % gsize) * BM;
+    n0 = ((b % (GM * num_n)) / gsize) * BN;
+}
+__global__ void __launch_bounds__(256) kernel_bk64(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
+                                                   float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
+                                                   int ldx, int ldw) {
+    int m0, n0;
+    bk64_tile_of(blockIdx.x, M, N, m0, n0);
+    bk64_tile(X, W, Y, M, N, K, ldy, accumulate, ldx, ldw, m0, n0);
+}
+// W (X4).  The persistent form (opt-in STRATA_PF_GEMM_PERSIST=1): gridDim.x blocks (the resident ones: 2 per WGP),
+// block b doing tiles b, b + gridDim.x, ... of the grouped order, so the concurrent tiles are 8 row tiles x 2 column
+// tiles that share their operands through the L2 while the blocks stay in k-phase.  These GEMMs are bound by the
+// operand traffic (the same kernel runs at 93% of the FP16 peak with L2-resident operands, 45-60% with real ones);
+// measured in tools/pfg_bench on the 6143-token prompt's shapes: with X unpadded (row stride K) 12-16% faster than
+// the grid of tiles, with X padded to K + 64 the same within noise (the padding spreads X's rows over the memory
+// channels; unpadded, a tile's 128 rows sit on 4 of 16 at any k).  A rendezvous of the blocks at every tile start
+// (a device counter) was tried and rejected: the slowest block set the pace, +25%.  The K loop is bk64_tile's: the
+// same bits as kernel_bk64.
+__global__ void __launch_bounds__(256) kernel_bk64p(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
+                                                    float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
+                                                    int ldx, int ldw, int ntiles) {
+    for (int t = blockIdx.x; t < ntiles; t += gridDim.x) {
+        int m0, n0;
+        bk64_tile_of(t, M, N, m0, n0);
+        bk64_tile(X, W, Y, M, N, K, ldy, accumulate, ldx, ldw, m0, n0);
+    }
 }
 // S23 (STRATA_PF_HCDOWN=1): the hyper-connection read's down (N nd = 320) and inject (N ni = 4) projections of xn16
 // (BF16, T x 10240, token stride ldx: 10240 + 64 avoids the 4 KB-multiple stride) as ONE GEMM - weight rows
@@ -686,15 +718,35 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
     if (ldx < K || ldw < K || ldx % 8 != 0 || ldw % 8 != 0 || ldx > (1LL << 30) || ldw > (1LL << 30)) return false;
     if (ldy < N || T > (1LL << 30) || N > (1LL << 30) || K > (1LL << 30)) return false;
     if (!strata_wmma_gfx11_device()) return false;
+    if (static const bool log = std::getenv("STRATA_PF_GEMM_LOG") != nullptr; log)   // the shapes, for tuning
+        std::fprintf(stderr, "pfg shape T %lld N %lld K %lld\n", (long long) T, (long long) N, (long long) K);
     hipStream_t s = static_cast<hipStream_t>(stream);
     const int acc = beta == 1.0f ? 1 : 0;
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
     // STRATA_PF_BK64=0: the BK 32 kernel for the wide shapes too (the A/B; the same bits)
     static const bool bk64 = [] { const char* v = std::getenv("STRATA_PF_BK64"); return !v || v[0] != '0'; }();
-    if (N >= 1024 && bk64 && K % 64 == 0) {
-        const unsigned grid = (unsigned) (mt * ((N + 255) / 256));
-        pfg::kernel_bk64<<<grid, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
-                                              (int) ldy, acc, (int) ldx, (int) ldw);
+    // STRATA_PF_SMALL_BK64=1: the BK 64 kernel from N 512 (the shared expert's 640 and the 512-row projections), where
+    // the BK 32 one reaches 24% of the 890M's FP16 peak against 54% for the wide shapes; partial column tiles are
+    // clamped on load and skipped on store, and the k order is the same, so the same bits
+    static const int64_t bk64_min_n = [] { const char* v = std::getenv("STRATA_PF_SMALL_BK64"); return v && v[0] == '1' ? 512 : 1024; }();
+    if (N >= bk64_min_n && bk64 && K % 64 == 0) {
+        const unsigned ntiles = (unsigned) (mt * ((N + 255) / 256));
+        // STRATA_PF_GEMM_PERSIST=1: persistent blocks (see kernel_bk64p); default a block per tile
+        static const bool persist = [] { const char* v = std::getenv("STRATA_PF_GEMM_PERSIST"); return v && v[0] == '1'; }();
+        static const unsigned nblk = [] {   // the resident blocks: 2 per WGP (HIP counts a WGP as a multiprocessor)
+            if (const char* v = std::getenv("STRATA_PF_GEMM_BLOCKS"); v && std::atoi(v) > 0) return (unsigned) std::atoi(v);
+            int dev = 0, mp = 8;
+            hipGetDevice(&dev);
+            hipDeviceGetAttribute(&mp, hipDeviceAttributeMultiprocessorCount, dev);
+            return (unsigned) (2 * mp);
+        }();
+        if (persist && ntiles > nblk) {
+            pfg::kernel_bk64p<<<nblk, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
+                                                   (int) ldy, acc, (int) ldx, (int) ldw, (int) ntiles);
+        } else {
+            pfg::kernel_bk64<<<ntiles, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
+                                                    (int) ldy, acc, (int) ldx, (int) ldw);
+        }
     } else if (N >= 1024) {
         const unsigned grid = (unsigned) (mt * ((N + 255) / 256));
         pfg::kernel<256, 64><<<grid, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,

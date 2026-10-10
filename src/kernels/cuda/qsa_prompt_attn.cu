@@ -1172,6 +1172,18 @@ struct alignas(16) SmemW {
     float mrow[16];
 };
 
+// STRATA_PA_PREFETCH: a workgroup barrier for LDS only.  __syncthreads() on gfx11 also waits for every global load in
+// flight (vmcnt(0)) and invalidates L0, which would make the next chunk's prefetched rows land before each barrier.
+__device__ __forceinline__ void pa_bar() {
+#if STRATA_PA_WMMA
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+    __syncthreads();
+#endif
+}
+
 __device__ __forceinline__ wf8 wmma_f16(wh8 a, wh8 b, wf8 c) {
 #if STRATA_PA_WMMA && STRATA_PA_GFX11
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
@@ -1193,7 +1205,7 @@ __device__ __forceinline__ wh8 i8_to_h(const uint32_t* x) {   // PA_KL codes, ex
 // SPLIT = true (default): q and p carried as FP16 hi + lo pairs (two WMMAs each: FP32-level). S23 (opt-in
 // STRATA_PA_FAST=1): SPLIT = false, one FP16 image each - half the matrix work, rounding-level (FP16 attention as the
 // usual flash-attention kernels), quality-gated
-template <bool SPLIT>
+template <bool SPLIT, bool PF = false>
 __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                                    const int32_t* __restrict__ ids,
                                                                    const int32_t* __restrict__ steps, int n_kv_heads,
@@ -1252,41 +1264,81 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
     for (int j = 0; j < 4; ++j) acc[j] = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
     const int n_chunks = (n + WCH - 1) / WCH;
-    for (int ci = 0; ci < n_chunks; ++ci) {
-        const int c0 = ci * WCH;
-        // this lane's cell of the chunk (lane = cell index): its pool row, or -1 (past the selection, or a block the
-        // KV streaming left non-resident: masked as in the decode kernel)
-        long long myrow = -1;
+    // this lane's cell of a chunk (lane = cell index): its pool row, or -1 (past the selection, or a block the KV
+    // streaming left non-resident: masked as in the decode kernel)
+    auto row_of = [&](int c0) -> long long {
+        long long r = -1;
         if (c0 + lane < n) {
             const int cell = __ldg(ids + c0 + lane);
             const long long page = (long long) __ldg(p.page_table + cell / page_size);
-            if (page >= 0) myrow = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
         }
+        return r;
+    };
+    auto load_v = [&](long long r, uint4& v0, uint4& v1, uint4& v2, uint4& v3, float& vsc) {
+        v0 = make_uint4(0, 0, 0, 0); v1 = v0; v2 = v0; v3 = v0; vsc = 0.0f;
+        if (r >= 0) {
+            const uint4* src = reinterpret_cast<const uint4*>(p.v_q + r * HD + dim0);
+            v0 = __ldg(src); v1 = __ldg(src + 1); v2 = __ldg(src + 2); v3 = __ldg(src + 3);
+            vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + r * (HD / KV_Q8_GROUP) + warp)));
+        }
+    };
+    // PF: the next chunk's rows are looked up while this chunk's q.k runs and its V slice loaded while the softmax and
+    // p.v run, so a chunk starts with its data in registers (the same values and arithmetic: the same bits)
+    long long pf_row = -1;
+    uint4 pv0 = make_uint4(0, 0, 0, 0), pv1 = pv0, pv2 = pv0, pv3 = pv0;
+    float pvsc = 0.0f;
+    // PF: the K fragments (2 cell tiles x 4 k-steps of this lane) and K scales of the next chunk, loaded with its V
+    uint4 pk[2][4];
+    float pks[2] = {0.0f, 0.0f};
+    auto load_k = [&](long long row) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const long long rr = __shfl(row, nt * 16 + col);
+            pks[nt] = rr >= 0 ? __half2float(__ushort_as_half(__ldg(p.k_scale + rr * (HD / KV_Q8_GROUP) + warp))) : 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                pk[nt][kk] = make_uint4(0, 0, 0, 0);
+#if STRATA_PA_GFX11
+                if (rr >= 0) pk[nt][kk] = __ldg(reinterpret_cast<const uint4*>(p.k_q + rr * HD + dim0 + kk * 16 + PA_KOFF(half)));
+#endif
+            }
+        }
+    };
+    if constexpr (PF) {
+        if (n_chunks > 0) { pf_row = row_of(0); load_v(pf_row, pv0, pv1, pv2, pv3, pvsc); load_k(pf_row); }
+    }
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        const int c0 = ci * WCH;
+        long long myrow;
+        if constexpr (PF) myrow = pf_row; else myrow = row_of(c0);
         // stage this wave's V slice of the chunk (64 bytes of each row) and the V scale; the K fragments come straight
         // from global memory (8 consecutive codes per lane)
         {
-            uint4 v0 = make_uint4(0, 0, 0, 0), v1 = v0, v2 = v0, v3 = v0;
-            float vsc = 0.0f;
-            if (myrow >= 0) {
-                const uint4* src = reinterpret_cast<const uint4*>(p.v_q + myrow * HD + dim0);
-                v0 = __ldg(src); v1 = __ldg(src + 1); v2 = __ldg(src + 2); v3 = __ldg(src + 3);
-                vsc = __half2float(__ushort_as_half(__ldg(p.v_scale + myrow * (HD / KV_Q8_GROUP) + warp)));
-            }
+            uint4 v0, v1, v2, v3;
+            float vsc;
+            if constexpr (PF) { v0 = pv0; v1 = pv1; v2 = pv2; v3 = pv3; vsc = pvsc; }
+            else load_v(myrow, v0, v1, v2, v3, vsc);
             uint4* dst = reinterpret_cast<uint4*>(&S.v[warp][lane][0]);
             dst[0] = v0; dst[1] = v1; dst[2] = v2; dst[3] = v3;
             S.vs[warp][lane] = vsc;
             if (warp == 0) S.valid[lane] = myrow >= 0;
         }
+        if constexpr (PF) pf_row = ci + 1 < n_chunks ? row_of(c0 + WCH) : -1;
         // q.k over this wave's 64 dims for two 16-cell tiles, times the cell's K scale for this group
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
             const long long rr = __shfl(myrow, nt * 16 + col);
             wf8 s = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
             float ksc = 0.0f;
-            if (rr >= 0) ksc = __half2float(__ushort_as_half(__ldg(p.k_scale + rr * (HD / KV_Q8_GROUP) + warp)));
+            if constexpr (PF && STRATA_PA_GFX11) ksc = pks[nt];
+            else if (rr >= 0) ksc = __half2float(__ushort_as_half(__ldg(p.k_scale + rr * (HD / KV_Q8_GROUP) + warp)));
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk) {
                 uint32_t kx[PA_KL / 4] = {};
+#if STRATA_PA_GFX11
+                if constexpr (PF) { kx[0] = pk[nt][kk].x; kx[1] = pk[nt][kk].y; kx[2] = pk[nt][kk].z; kx[3] = pk[nt][kk].w; } else
+#endif
                 if (rr >= 0) {
                     const uint32_t* src = reinterpret_cast<const uint32_t*>(p.k_q + rr * HD + dim0 + kk * 16 + PA_KOFF(half));
 #if STRATA_PA_GFX11
@@ -1304,7 +1356,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 #pragma unroll
             for (int i = 0; i < 8; ++i) S.part[warp][PA_ROW(i, half)][nt * 16 + col] = s[i] * ksc;
         }
-        __syncthreads();
+        if constexpr (PF) pa_bar(); else __syncthreads();
         // online softmax over the four groups' sum (fixed order): row t/8, 4 cells per thread
         {
             const int r = t >> 3, sub = t & 7;
@@ -1337,7 +1389,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                 S.mrow[r] = m_new;
             }
         }
-        __syncthreads();
+        if constexpr (PF) { pa_bar(); load_v(pf_row, pv0, pv1, pv2, pv3, pvsc); load_k(pf_row); } else __syncthreads();
         // p.v over this wave's 64 dims: 4 tiles of 16 dims, 2 k-steps of 16 cells
         {
             float vmax = S.vs[warp][lane];
@@ -1430,7 +1482,12 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
         static const bool fast = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
         static const int64_t min_t = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
-        if (fast && n_q >= min_t)
+        static const bool pf = [] { const char* e = std::getenv("STRATA_PA_PREFETCH"); return e != nullptr && e[0] == '1'; }();
+        if (fast && n_q >= min_t && pf)
+            prompt_attn_wmma_kernel<false, true><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
+                q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+                (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+        else if (fast && n_q >= min_t)
             prompt_attn_wmma_kernel<false><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
                 q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
                 (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);

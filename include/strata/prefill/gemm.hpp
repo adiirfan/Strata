@@ -74,7 +74,7 @@ private:
     uint16_t* tc_x_ = nullptr;
     int64_t tc_x_elems_ = 0;
     bool native_mmq(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                    int64_t ldy);
+                    int64_t ldy, int64_t ldx = 0);
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
