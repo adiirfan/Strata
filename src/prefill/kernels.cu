@@ -1678,7 +1678,7 @@ __global__ void moe_combine4h_kernel(const uint16_t* __restrict__ Dm, const int3
         ww[k] = w[t * 10 + k];
         v[k] = *reinterpret_cast<const uint2*>(Dm + (int64_t) slot[t * 10 + k] * N + d);
     }
-    auto h = [](uint32_t u) { return (float) __builtin_bit_cast(_Float16, (uint16_t) u); };
+    auto h = [](uint32_t u) { return __half2float(__ushort_as_half((unsigned short) u)); };   // exact either way; _Float16 is HIP-only
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
         s.x = fmaf(ww[k], h(v[k].x & 0xffffu), s.x); s.y = fmaf(ww[k], h(v[k].x >> 16), s.y);
