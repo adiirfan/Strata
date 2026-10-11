@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <deque>
 #include <fstream>
 #include <filesystem>
@@ -956,6 +957,12 @@ void FileExpertSource::close() {
     paths_.clear();
     for (void* h : direct_) close_direct(h);
     direct_.clear();
+    for (void* h : pp_direct_) close_direct(h);
+    pp_direct_.clear();
+#if defined(__linux__)
+    if (mirror_fd_ >= 0) ::close(mirror_fd_);
+#endif
+    mirror_fd_ = mirror_main_ = -1;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_buf_.clear();
@@ -1095,6 +1102,15 @@ bool FileExpertSource::open_gguf(std::string& err) {
             role_ptr_[i] = m.base + (size_t) at;
             role_bytes_[i] = per[r];
         }
+    }
+    // STRATA_EXPERT_MIRROR=<file> (opt-in, Linux): a copy of this shard on a second drive - whole, or holding only the
+    // experts it serves (tools/rtx5080/expert_mirror.py).  The direct reads (read_direct: STRATA_PROMPT_DIRECT=1, or an
+    // unbuffered file tier) take every layer's experts from mirror_cut_ on from it - STRATA_EXPERT_MIRROR_SHARE of
+    // them, default 0.5 - so both drives serve each layer at once (the prompt stager finishes a layer before it
+    // starts the next).  The mapped reads stay on the shard.  Same bytes at the same offsets, so the same answers.
+    if (const char* mv = std::getenv("STRATA_EXPERT_MIRROR"); mv != nullptr && mv[0] != '\0') {
+        const char* sv = std::getenv("STRATA_EXPERT_MIRROR_SHARE");
+        if (!open_mirror(mv, sv != nullptr ? std::atof(sv) : 0.5, err)) return false;
     }
     base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
     warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
@@ -1502,6 +1518,81 @@ bool FileExpertSource::open_direct(std::string& why) {
 #endif
 }
 
+bool FileExpertSource::open_mirror(const std::string& path, double share, std::string& err) {
+#if defined(__linux__)
+    for (size_t f = 0; f < paths_.size(); ++f)
+        if (paths_[f] == gguf_) mirror_main_ = (int) f;
+    if (mirror_main_ < 0) { err = "STRATA_EXPERT_MIRROR: no experts in " + gguf_; return false; }
+    mirror_cut_ = n_expert_ - std::llround((double) n_expert_ * std::clamp(share, 0.0, 1.0));
+    struct stat a{}, b{};
+    if (::stat(gguf_.c_str(), &a) != 0 || ::stat(path.c_str(), &b) != 0 || a.st_size != b.st_size) {
+        err = "STRATA_EXPERT_MIRROR: " + path + " is missing or not the size of " + gguf_;
+        mirror_main_ = -1;
+        return false;
+    }
+    // a copy made for a smaller share has holes where these experts are: compare the first and last 4 KiB of every
+    // role's served range with the shard (a hole reads as zeros, and would compute with them)
+    const int fs = ::open(gguf_.c_str(), O_RDONLY | O_CLOEXEC), fm = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    bool same = fs >= 0 && fm >= 0;
+    int64_t bad_layer = -1;
+    std::vector<uint8_t> x(4096), y(4096);
+    for (int64_t l = 0; same && l < n_layers_ && mirror_cut_ < n_expert_; ++l)
+        for (int r = 0; same && r < 3; ++r) {
+            const size_t i = (size_t) (3 * l + r);
+            if (role_file_[i] != mirror_main_) continue;
+            const uint64_t per = role_bytes_[i], off = (uint64_t) (role_ptr_[i] - maps_[(size_t) mirror_main_].base);
+            const uint64_t lo = off + (uint64_t) mirror_cut_ * per, hi = off + (uint64_t) n_expert_ * per;
+            const size_t k = (size_t) std::min<uint64_t>(4096, hi - lo);
+            for (const uint64_t at : {lo, hi - k}) {
+                if (!pread_full(fs, x.data(), k, at) || !pread_full(fm, y.data(), k, at) || std::memcmp(x.data(), y.data(), k) != 0) {
+                    same = false;
+                    bad_layer = l;
+                    break;
+                }
+            }
+        }
+    if (fs >= 0) ::close(fs);
+    if (fm >= 0) ::close(fm);
+    if (same) mirror_fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (!same || mirror_fd_ < 0) {
+        err = !same ? "STRATA_EXPERT_MIRROR: " + path + " does not hold experts " + std::to_string(mirror_cut_) + ".. of layer " +
+                          std::to_string(bad_layer) + " as " + gguf_ + " does (made for a smaller STRATA_EXPERT_MIRROR_SHARE?)"
+                    : "STRATA_EXPERT_MIRROR: cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + ")";
+        mirror_fd_ = mirror_main_ = -1;
+        return false;
+    }
+    std::fprintf(stderr, "strata experts: the direct reads take experts %lld.. of every layer from the mirror %s\n",
+                 (long long) mirror_cut_, path.c_str());
+    return true;
+#else
+    (void) path; (void) share;
+    err = "STRATA_EXPERT_MIRROR: Linux only";
+    return false;
+#endif
+}
+
+bool FileExpertSource::open_prompt_direct(std::string& why) {
+#if defined(__linux__)
+    if (!direct_.empty()) { why = "the file tier reads unbuffered already"; return false; }
+    if (paths_.empty()) { why = "no expert files open"; return false; }
+    for (const std::string& path : paths_) {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (fd < 0) {
+            why = "cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + ")";
+            for (void* d : pp_direct_) close_direct(d);
+            pp_direct_.clear();
+            return false;
+        }
+        pp_direct_.push_back((void*) (intptr_t) fd);
+    }
+    why = "the prompt's expert copies and the refill after it read straight from the drive";
+    return true;
+#else
+    why = "Linux only";
+    return false;
+#endif
+}
+
 bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
 #if defined(_WIN32) || defined(__linux__)
     if (base_ == nullptr || paths_.empty() || !direct_.empty()) {
@@ -1696,6 +1787,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     // own context and aligned buffer, kept for its next batch, so concurrent batches never see each other's events.
     constexpr uint64_t kSector = 4096, kMerge = 32ull << 20;
     constexpr long kDepth = 256;   // requests in flight per thread; a larger batch is read in waves of this many
+    constexpr int kMirror = 1 << 30;   // Window::file of a read from STRATA_EXPERT_MIRROR's copy (mirror_fd_)
     struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
     struct Req { int fd; uint64_t a0, size, pos; };
     struct Scratch {
@@ -1715,6 +1807,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         }
     };
     thread_local Scratch sc;
+    const std::vector<void*>& dv = direct_.empty() ? pp_direct_ : direct_;   // open_prompt_direct's when not unbuffered
+    if (dv.empty()) return false;
     if (sc.ctx == 0 && syscall(SYS_io_setup, kDepth, &sc.ctx) != 0) {
         sc.ctx = 0;
         return false;   // no AIO (a seccomp profile, aio-max-nr): the caller falls back to the mapped copy
@@ -1737,7 +1831,9 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             const Map& m = maps_[(size_t) role_file_[i]];
             const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
-            sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
+            int file = role_file_[i];
+            if (mirror_fd_ >= 0 && file == mirror_main_ && f.e >= mirror_cut_) file = kMirror;   // same bytes, same offset
+            sc.win.push_back({file, a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
             at += per;
         }
     }
@@ -1764,7 +1860,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(int) (intptr_t) direct_[(size_t) x.file], x.a0, x.size, total});
+        sc.req.push_back({x.file == kMirror ? mirror_fd_ : (int) (intptr_t) dv[(size_t) x.file], x.a0, x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -2084,7 +2180,9 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 // copy_blob made one ~2 MB request each - and NTFS serves the unbuffered reads of a mapped file one at a time, so the
 // request size is what sets the rate (see read_direct).  The blobs the RAM copy holds are copied as before.
 bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
-    if (direct_.empty() || n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
+    // unbuffered: one blob goes through copy_blob (copy_from_files reads it directly); prompt-only: copy_blob reads
+    // through the file cache, so every batch comes here
+    if (direct_.empty() ? pp_direct_.empty() : n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
     thread_local std::vector<Fill> fills;
     fills.clear();
     uint64_t bytes = 0;

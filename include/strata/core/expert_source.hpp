@@ -586,6 +586,13 @@ public:
     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
     bool recheck_unbuffered(std::string& why);
     bool unbuffered() const { return !direct_.empty(); }
+    /// STRATA_PROMPT_DIRECT=1 (Linux; the GGUF in place without a RAM budget): O_DIRECT descriptors for the prompt
+    /// path only - copy_blobs (the prompt stager, the refill after a prompt) reads through read_direct, while the
+    /// mapped reads and the io prefetch keep the file cache.  Under a tight RAM cap the cached reads, not the drive,
+    /// set the prompt's rate.  False (and `why`) when it cannot open them; startup only.
+    bool open_prompt_direct(std::string& why);
+    /// STRATA_EXPERT_MIRROR is open: the direct reads split every layer between the shard and its copy.
+    bool mirrored() const { return mirror_fd_ >= 0; }
     /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
     /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
@@ -679,6 +686,11 @@ private:
     bool open_direct(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    std::vector<void*> pp_direct_;            ///< open_prompt_direct: per file, an O_DIRECT fd for copy_blobs only
+    int mirror_main_ = -1;                    ///< STRATA_EXPERT_MIRROR: the shard's index in maps_ (-1: no mirror)
+    int mirror_fd_ = -1;                      ///< the copy, O_DIRECT (read_direct only)
+    int64_t mirror_cut_ = 0;                  ///< read_direct: a layer's experts from this one on come from the copy
+    bool open_mirror(const std::string& path, double share, std::string& err);
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }

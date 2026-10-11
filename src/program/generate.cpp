@@ -262,20 +262,66 @@ bool refill_batched(strata::core::ExpertSource& src, strata::core::ExpertCache& 
             return false;
         }
     bool ok = true;
+    // the reading threads live for the whole refill: an unbuffered read keeps an aligned buffer and an AIO context per
+    // thread, which threads started per batch set up and tore down again every 64 experts
+    std::mutex mu;
+    std::condition_variable go_cv, done_cv;
+    uint64_t go = 0;
+    int done = 0;
+    bool quit = false;
+    size_t cur_at = 0, cur_n = 0, cur_k = 0;
+    std::atomic<size_t> next{0};
+    std::atomic<bool> good{true};
+    auto work = [&] {
+        constexpr size_t R = 8;   // a run per call: copy_blobs reads it as one batch (unbuffered: one io_submit)
+        int32_t rl[R], re[R];
+        uint8_t* rd[R];
+        for (size_t j0; (j0 = next.fetch_add(R)) < cur_n;) {
+            const size_t m = std::min(R, cur_n - j0);
+            for (size_t q = 0; q < m; ++q) {
+                const auto& pr = lent[cur_at + j0 + q];
+                rl[q] = (int32_t) (pr.first / n_expert);
+                re[q] = (int32_t) (pr.first % n_expert);
+                rd[q] = stage[cur_k] + (j0 + q) * maxb;
+            }
+            if (!src.copy_blobs(rl, re, rd, m)) good = false;
+        }
+    };
+    std::vector<std::thread> ts;
+    for (int t = 1; t < threads; ++t)
+        ts.emplace_back([&] {
+            for (uint64_t seen = 0;;) {
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    go_cv.wait(lk, [&] { return quit || go != seen; });
+                    if (quit) return;
+                    seen = go;
+                }
+                work();
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    ++done;
+                }
+                done_cv.notify_one();
+            }
+        });
     for (size_t at = 0, k = 0; ok && at < lent.size(); at += B, k ^= 1) {
         const size_t n = std::min(B, lent.size() - at);
-        std::atomic<size_t> next{0};
-        std::atomic<bool> good{true};
-        auto work = [&] {
-            for (size_t j; (j = next.fetch_add(1)) < n;) {
-                const auto& pr = lent[at + j];
-                if (!src.copy_blob(pr.first / n_expert, pr.first % n_expert, stage[k] + j * maxb)) good = false;
-            }
-        };
-        std::vector<std::thread> ts;
-        for (int t = 1; t < threads; ++t) ts.emplace_back(work);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            cur_at = at;
+            cur_n = n;
+            cur_k = k;
+            next.store(0);
+            done = 0;
+            ++go;
+        }
+        go_cv.notify_all();
         work();
-        for (auto& t : ts) t.join();
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            done_cv.wait(lk, [&] { return done == (int) ts.size(); });
+        }
         if (!good) { err = "refill: reading a lent expert failed"; ok = false; break; }
         // the previous batch's copies (out of the other buffer) land before that buffer is read into again
         if (!cache.sync_queued(err)) { ok = false; break; }
@@ -285,6 +331,12 @@ bool refill_batched(strata::core::ExpertSource& src, strata::core::ExpertCache& 
             if (!cache.fill_slot_queued(pr.second, stage[k] + j * maxb, err, nb)) ok = false;
         }
     }
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        quit = true;
+    }
+    go_cv.notify_all();
+    for (auto& t : ts) t.join();
     if (ok && !cache.sync_queued(err)) ok = false;
     for (auto& st : stage) cudaFreeHost(st);
     return ok;
@@ -4262,6 +4314,18 @@ int main(int argc, char** argv) {
         } else if (const char* sv = std::getenv("STRATA_IO_STATS"); sv != nullptr && std::atoi(sv) != 0) {
             src.set_io_stats(true);
         }
+        // STRATA_PROMPT_DIRECT=1: the prompt's expert copies and the refill read straight from the drive, the rest
+        // as above (under a tight RAM cap the cached reads, not the drives, set the prompt's rate)
+        bool prompt_direct = false;
+        if (const char* pv = std::getenv("STRATA_PROMPT_DIRECT"); pv != nullptr && std::atoi(pv) != 0 && !src.unbuffered()) {
+            std::string why;
+            prompt_direct = src.open_prompt_direct(why);
+            std::fprintf(stderr, "strata generate: prompt reads %s (STRATA_PROMPT_DIRECT=1: %s)\n",
+                         prompt_direct ? "unbuffered" : "through the file cache", why.c_str());
+        }
+        if (src.mirrored() && !prompt_direct && !src.unbuffered())
+            std::fprintf(stderr, "strata generate: note: STRATA_EXPERT_MIRROR serves only the direct reads "
+                                 "(STRATA_PROMPT_DIRECT=1, or an unbuffered file tier); none run here\n");
         srcp = &src;
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
