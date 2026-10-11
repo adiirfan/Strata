@@ -3116,6 +3116,18 @@ const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
     return blob(layer, expert);
 }
 
+thread_local const float* g_pool_weights = nullptr;
+
+bool FileExpertSource::has_blob(int64_t layer, int64_t expert) {
+    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return true;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (complement_ready_ && resident_blob(index) != nullptr) return true;
+    if (!override_.empty() && override_[index] != nullptr) return true;
+    if (!staged()) return true;
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    return stage_of_.find(layer * n_expert_ + expert) != stage_of_.end();   // staged, or being read
+}
+
 const uint8_t* FileExpertSource::blob_if_ready(int64_t layer, int64_t expert) {
     // only a staged blob can be "not here yet"; every other kind of hand-out is what blob() does
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_ || complement_ready_ ||
@@ -3495,9 +3507,27 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // copy_or_zero_from_mapped copies every row, so there the host still zeroes them
     static const bool device_plan = [] { const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); return v != nullptr && std::atoi(v) != 0; }();
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
+    // STRATA_EXPERT_SKIP=W: a CPU expert no tier holds (nor is reading) whose weight is below W for every token routed
+    // to it here is skipped (kind -3: its rows are zero, nothing is read) - changes the output, opt-in
+    static const float skip_w = [] { const char* v = std::getenv("STRATA_EXPERT_SKIP"); return v != nullptr ? (float) std::atof(v) : 0.0f; }();
+    if (skip_w > 0.0f && g_pool_weights != nullptr) {
+        const float* w = g_pool_weights;
+        for (int64_t i = 0; i < n; ++i) {
+            if (kind[i] != -1 || ids[i] < 0 || ids[i] >= d.n_expert) continue;
+            bool first = true, light = true;
+            for (int64_t j = 0; j < n && light; ++j)
+                if (ids[j] == ids[i] && kind[j] < 0) {
+                    if (j < i) first = false;
+                    if (w[j] >= skip_w) light = false;
+                }
+            if (!first || !light || d.src->has_blob(d.layers, ids[i])) continue;
+            for (int64_t j = i; j < n; ++j)
+                if (ids[j] == ids[i] && kind[j] == -1) { kind[j] = -3; ++d.skipped; }
+        }
+    }
     bool any_cpu = false;
     for (int64_t i = 0; i < n; ++i)
-        if (kind[i] < 0) { any_cpu = true; break; }
+        if (kind[i] == -1) { any_cpu = true; break; }
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
@@ -3517,7 +3547,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static thread_local std::vector<int64_t> miss;
         miss.clear();
         for (int64_t i = 0; i < n_tok * k; ++i)
-            if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
+            if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
@@ -3538,6 +3568,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_layer = d.layers;
                 d.fail_expert = e;
                 return;
+            }
+            if (kind[i] == -3) {            // STRATA_EXPERT_SKIP: left out, its row adds nothing
+                std::memset(row, 0, (size_t) H * sizeof(float));
+                continue;
             }
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;

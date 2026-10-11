@@ -6932,6 +6932,8 @@ int main(int argc, char** argv) {
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
         }
         ver.set_remote_expert_opt(remote_opt.get());
+        if (const char* sk = std::getenv("STRATA_EXPERT_SKIP"); sk != nullptr && std::atof(sk) > 0.0)
+            ver.set_always_publish(true);   // the routing weights reach the host (STRATA_EXPERT_SKIP reads them)
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -11659,6 +11661,8 @@ int main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
+        if (const char* sk = std::getenv("STRATA_EXPERT_SKIP"); sk != nullptr && std::atof(sk) > 0.0)
+            ver.set_always_publish(true);   // the routing weights reach the host (STRATA_EXPERT_SKIP reads them)
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -12090,6 +12094,9 @@ int main(int argc, char** argv) {
                                 "the spot in %.1f layer calls (%.2f ms)\n", "hand-out",
                                 (double) ic.hand_hit / rounds, (double) ic.hand_late / rounds, (double) ic.hand_late_us / 1e3 / rounds,
                                 (double) ic.hand_now / rounds, (double) ic.hand_now_calls / rounds, (double) ic.hand_now_us / 1e3 / rounds);
+                if (rounds > 0 && drive.d.skipped > 0)
+                    std::printf("%-24s %.1f entries per round left out (STRATA_EXPERT_SKIP)\n", "expert skip",
+                                (double) drive.d.skipped / rounds);
             }
             if (drive.d.lookahead != nullptr)
                 std::printf("%-24s %lld experts warmed, %lld of the file tier's %lld blob reads had been warmed (%.1f%%); "

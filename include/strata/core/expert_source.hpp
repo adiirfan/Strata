@@ -150,6 +150,8 @@ public:
     /// `blob`, but nullptr instead of waiting when the blob is still being read (STRATA_POOL_EARLY: the pool computes
     /// what is here first).  Defaults to `blob`.
     virtual const uint8_t* blob_if_ready(int64_t layer, int64_t expert) { return blob(layer, expert); }
+    /// STRATA_EXPERT_SKIP: whether the blob is in RAM already or on its way (no new read needed).  Defaults to true.
+    virtual bool has_blob(int64_t layer, int64_t expert) { (void) layer; (void) expert; return true; }
 
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
@@ -292,6 +294,10 @@ struct GpuPlanSink {
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ForesightSwap;
 
+/// STRATA_EXPERT_SKIP: the routing weights of the window the verifier is serving (its mapped host copy, published
+/// with Verifier::set_always_publish), set around each pool call; nullptr when not published.
+extern thread_local const float* g_pool_weights;
+
 struct ExpertDispatch {
     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
     strata::kernels::cpu::ExpertPool* pool = nullptr;
@@ -324,6 +330,7 @@ struct ExpertDispatch {
     int64_t cache_hits = 0;      ///< lookups already resident
     int64_t cache_admitted = 0;  ///< lookups that took a slot
     int64_t cache_refused = 0;   ///< lookups with no slot free (the cache is full)
+    int64_t skipped = 0;         ///< STRATA_EXPERT_SKIP: entries left out (their expert in no tier, light)
     void* cache_stream = nullptr;
     const char* cache_fail = nullptr;
 
@@ -622,6 +629,7 @@ public:
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     const uint8_t* blob_if_ready(int64_t layer, int64_t expert) override;
+    bool has_blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
     /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
