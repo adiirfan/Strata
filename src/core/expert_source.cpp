@@ -557,6 +557,7 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     c.crit_n = io_crit_n_.load(std::memory_order_relaxed);
     c.hand_hit = hand_hit_.load(); c.hand_late = hand_late_.load(); c.hand_late_us = hand_late_us_.load();
     c.hand_now = hand_now_.load(); c.hand_now_us = hand_now_us_.load(); c.hand_now_calls = hand_now_calls_.load();
+    c.rd_io_us = rd_io_us_.load(); c.rd_copy_us = rd_copy_us_.load(); c.rd_n = rd_n_.load();
     return c;
 }
 
@@ -698,7 +699,7 @@ void FileExpertSource::io_worker() {
             stage_pf_[v] = 1;
             dst = stage_buf_[v].get();
         }
-        const bool ok = copy_from_files(layer, expert, dst);
+        const bool ok = copy_from_files(layer, expert, dst, true);
         io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
         if (ok) file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
         {
@@ -1139,11 +1140,11 @@ bool FileExpertSource::open_gguf(std::string& err) {
     return true;
 }
 
-bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
+bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst, bool stage_dst) const {
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     if (!direct_.empty() || decode_direct_) {   // #286: from the drive; a failed read falls back to the mapping below
         const Fill f{0, layer, expert, dst};
-        if (read_direct(&f, 1, true)) return true;
+        if (read_direct(&f, 1, true, stage_dst)) return true;
         direct_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
 #if defined(__linux__)
@@ -1193,7 +1194,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
 constexpr uint64_t kStagePinFloor = 3ull << 30;   // RAM left available after a pinned stage buffer
 void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
     if (pinned) (void) cudaFreeHost(p);
-    else delete[] p;
+    else std::free(p);   // posix_memalign (claim_stage)
 }
 
 // A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
@@ -1249,10 +1250,13 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         }
         void* p = nullptr;
         cudaError_t pin_err = cudaSuccess;
-        if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) need, cudaHostAllocDefault);
+        // 4 KiB-aligned and whole 4 KiB blocks: a packed copy's blob is read straight in (read_direct, stage_dst)
+        const size_t alloc = (size_t) ((need + 4095) / 4096 * 4096);
+        if (want_pin) pin_err = cudaHostAlloc(&p, alloc, cudaHostAllocDefault);
         const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
         if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
-        uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) need];
+        void* q = nullptr;
+        uint8_t* raw = pinned ? (uint8_t*) p : (posix_memalign(&q, 4096, alloc) == 0 ? (uint8_t*) q : nullptr);
         if (raw == nullptr) return false;
         stage_buf_.emplace_back(raw, StageBufFree{pinned});
         stage_cap_.push_back(need);
@@ -1291,7 +1295,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
 // Fills buffer `v` (reserved by claim_stage) outside the lock, then publishes it.
 bool FileExpertSource::fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst) {
     const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = copy_from_files(layer, expert, dst);
+    const bool ok = copy_from_files(layer, expert, dst, true);
     publish_stage(v, layer, ok, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
     return ok;
 }
@@ -1474,7 +1478,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
             for (size_t at; (at = next.fetch_add(16)) < todo.size();) {
                 const size_t k = std::min<size_t>(16, todo.size() - at);
                 const auto t0 = std::chrono::steady_clock::now();
-                const bool ok = read_direct(todo.data() + at, k, true);
+                const bool ok = read_direct(todo.data() + at, k, true, true);
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 for (size_t i = at; i < at + k; ++i) {
                     const Fill& f = todo[i];
@@ -1825,7 +1829,7 @@ bool FileExpertSource::drop_mapping(std::string& why) {
 #endif
 }
 
-bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) const {
+bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode, bool stage_dst) const {
 #if defined(_WIN32)
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
@@ -1948,8 +1952,9 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) con
     constexpr uint64_t kSector = 4096, kMerge = 32ull << 20;
     constexpr long kDepth = 256;   // requests in flight per thread; a larger batch is read in waves of this many
     constexpr int kMirror = 1 << 30;   // Window::file of a read from STRATA_EXPERT_MIRROR's copy (mirror_fd_)
-    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
-    struct Req { int fd; uint64_t a0, size, pos; };
+    // to_dst: the window is read straight into dst (a packed blob into its stage buffer), not through the bounce buffer
+    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; bool to_dst = false; };
+    struct Req { int fd; uint64_t a0, size, pos; uint8_t* to; };
     struct Scratch {
         uint8_t* buf = nullptr;
         size_t cap = 0;
@@ -1986,7 +1991,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) con
         }
         if (packed_ && f.e >= (decode ? mirror_cut_decode_ : mirror_cut_)) {   // expert_pack.py: the blob in one piece
             const uint64_t at0 = packed_off_[(size_t) f.layer] + (uint64_t) (f.e - packed_first_) * packed_stride_[(size_t) f.layer];
-            sc.win.push_back({kMirror, at0, packed_stride_[(size_t) f.layer], 0, layer_blob_bytes_[(size_t) f.layer], 0, f.dst, 0, 0});
+            sc.win.push_back({kMirror, at0, packed_stride_[(size_t) f.layer], 0, layer_blob_bytes_[(size_t) f.layer], 0, f.dst, 0, 0,
+                              stage_dst && ((uintptr_t) f.dst & 4095) == 0});
             continue;
         }
         uint64_t at = 0;
@@ -2013,7 +2019,14 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) con
     int last_file = -1;
     for (size_t w : sc.order) {
         Window& x = sc.win[w];
-        if (!sc.req.empty() && x.file == last_file) {
+        if (x.to_dst) {   // its own request, into its stage buffer
+            sc.req.push_back({mirror_fd_, x.a0, x.size, 0, x.dst});
+            last_file = -2;
+            x.req = sc.req.size() - 1;
+            x.in_req = 0;
+            continue;
+        }
+        if (!sc.req.empty() && x.file == last_file && sc.req.back().to == nullptr) {
             Req& q = sc.req.back();
             const uint64_t end = q.a0 + q.size, xend = x.a0 + x.size;
             if (x.a0 <= end && std::max(end, xend) - q.a0 <= kMerge) {
@@ -2026,7 +2039,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) con
                 continue;
             }
         }
-        sc.req.push_back({x.file == kMirror ? mirror_fd_ : (int) (intptr_t) dv[(size_t) x.file], x.a0, x.size, total});
+        sc.req.push_back({x.file == kMirror ? mirror_fd_ : (int) (intptr_t) dv[(size_t) x.file], x.a0, x.size, total, nullptr});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -2044,6 +2057,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) con
     sc.cbp.resize(sc.cb.size());
     sc.ev.resize(sc.cb.size());
     bool ok = true;
+    const auto rd_t0 = std::chrono::steady_clock::now();
     for (size_t w0 = 0; ok && w0 < sc.req.size(); w0 += (size_t) kDepth) {
         const size_t wn = std::min<size_t>((size_t) kDepth, sc.req.size() - w0);
         for (size_t j = 0; j < wn; ++j) {
@@ -2052,7 +2066,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) con
             std::memset(&c, 0, sizeof c);
             c.aio_lio_opcode = IOCB_CMD_PREAD;
             c.aio_fildes = (uint32_t) r.fd;
-            c.aio_buf = (uint64_t) (uintptr_t) (sc.buf + r.pos);
+            c.aio_buf = (uint64_t) (uintptr_t) (r.to != nullptr ? r.to : sc.buf + r.pos);
             c.aio_nbytes = r.size;
             c.aio_offset = (int64_t) r.a0;
             c.aio_data = (uint64_t) (w0 + j);
@@ -2086,10 +2100,18 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) con
         }
     }
     if (!ok) return false;
+    const auto rd_t1 = std::chrono::steady_clock::now();
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
         if (sc.got[x.req] < 0 || (uint64_t) sc.got[x.req] < x.in_req + x.skip + x.n) return false;
+        if (x.to_dst) continue;   // already in place
         std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
+    }
+    if (decode) {
+        const auto rd_t2 = std::chrono::steady_clock::now();
+        rd_io_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(rd_t1 - rd_t0).count(), std::memory_order_relaxed);
+        rd_copy_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(rd_t2 - rd_t1).count(), std::memory_order_relaxed);
+        rd_n_.fetch_add(n, std::memory_order_relaxed);
     }
     return true;
 #else

@@ -688,6 +688,7 @@ public:
         uint64_t crit_n = 0;
         uint64_t hand_hit = 0, hand_late = 0, hand_late_us = 0;   ///< decode hand-out: staged already / still being read (wait)
         uint64_t hand_now = 0, hand_now_us = 0, hand_now_calls = 0; ///< read on the spot by the layer (prefetch's fill_many)
+        uint64_t rd_io_us = 0, rd_copy_us = 0, rd_n = 0;           ///< the decode's direct reads: drive wait, bounce copy
     };
     IoCounters io_counters() const;
 
@@ -695,7 +696,8 @@ private:
     const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
-    bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
+    /// `stage_dst`: dst is a stage buffer (4 KiB-aligned, whole 4 KiB blocks: a packed blob may be read straight in).
+    bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst, bool stage_dst = false) const;
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
@@ -707,7 +709,7 @@ private:
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
     /// `decode`: the decode's scattered blobs (STRATA_EXPERT_MIRROR_DECODE_SHARE splits them), else the prompt's.
-    bool read_direct(const Fill* fills, size_t n, bool decode = false) const;
+    bool read_direct(const Fill* fills, size_t n, bool decode = false, bool stage_dst = false) const;
     bool open_direct(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
@@ -795,6 +797,7 @@ private:
     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
         io_crit_us_{0}, io_crit_n_{0};
     mutable std::atomic<uint64_t> hand_hit_{0}, hand_late_{0}, hand_late_us_{0}, hand_now_{0}, hand_now_us_{0}, hand_now_calls_{0};
+    mutable std::atomic<uint64_t> rd_io_us_{0}, rd_copy_us_{0}, rd_n_{0};
     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
     /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob.
     int spans(int64_t layer, int64_t expert, Span* out) const;

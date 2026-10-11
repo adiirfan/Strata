@@ -12094,6 +12094,9 @@ int main(int argc, char** argv) {
                                 "the spot in %.1f layer calls (%.2f ms)\n", "hand-out",
                                 (double) ic.hand_hit / rounds, (double) ic.hand_late / rounds, (double) ic.hand_late_us / 1e3 / rounds,
                                 (double) ic.hand_now / rounds, (double) ic.hand_now_calls / rounds, (double) ic.hand_now_us / 1e3 / rounds);
+                if (rounds > 0 && ic.rd_n > 0)
+                    std::printf("%-24s %.1f blobs per round: drive %.3f ms, bounce copy %.3f ms each (thread time)\n", "direct reads",
+                                (double) ic.rd_n / rounds, (double) ic.rd_io_us / 1e3 / (double) ic.rd_n, (double) ic.rd_copy_us / 1e3 / (double) ic.rd_n);
                 if (rounds > 0 && drive.d.skipped > 0)
                     std::printf("%-24s %.1f entries per round left out (STRATA_EXPERT_SKIP)\n", "expert skip",
                                 (double) drive.d.skipped / rounds);
