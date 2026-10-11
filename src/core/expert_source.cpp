@@ -665,7 +665,7 @@ void FileExpertSource::io_worker() {
             continue;
         }
         uint64_t total = 0;
-        if (cached_bytes(layer, expert, total, false) >= total) {
+        if (!decode_direct_ && cached_bytes(layer, expert, total, false) >= total) {   // direct: never cached
             io_pf_skips_.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -970,6 +970,8 @@ void FileExpertSource::close() {
         stage_epoch_.clear();
         stage_used_.clear();
         stage_busy_.clear();
+        stage_cap_.clear();
+        stage_class_bufs_.clear();
         stage_pf_.clear();
         stage_of_.clear();
         stage_blob_ = 0;
@@ -1120,7 +1122,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
 
 bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
-    if (!direct_.empty()) {   // #286: from the drive; a failed read falls back to the mapping below
+    if (!direct_.empty() || decode_direct_) {   // #286: from the drive; a failed read falls back to the mapping below
         const Fill f{0, layer, expert, dst};
         if (read_direct(&f, 1)) return true;
         direct_fallbacks_.fetch_add(1, std::memory_order_relaxed);
@@ -1196,12 +1198,23 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     }
     v = stage_buf_.size();
     uint64_t oldest = std::numeric_limits<uint64_t>::max();
-    for (size_t i = 0; i < stage_buf_.size(); ++i)
+    // STRATA_STAGE_KEEP: each blob size grows to its share of stage_keep_ buffers, exactly that size, before it reuses
+    // one of its own (the oldest), so the pool keeps the last blobs read; otherwise any buffer, as before
+    const auto ck = stage_class_keep_.find(layer_blob_bytes_[(size_t) (key / n_expert_)]);
+    const bool keep = ck != stage_class_keep_.end();
+    const uint64_t need = keep ? ck->first : stage_blob_;
+    std::vector<size_t>* mine = keep ? &stage_class_bufs_[need] : nullptr;
+    auto victim = [&](size_t i) {
         if (!stage_busy_[i] && (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
             stage_used_[i] < oldest) {
             oldest = stage_used_[i];
             v = i;
         }
+    };
+    if (!keep)
+        for (size_t i = 0; i < stage_buf_.size(); ++i) victim(i);
+    else if (mine->size() >= ck->second)
+        for (size_t i : *mine) victim(i);
     if (v == stage_buf_.size()) {
         // Pinned, where the driver allows: a stage buffer is the source of the cache fill's cudaMemcpyAsync,
         // and a pageable source is staged through the driver's bounce buffer - an extra copy at a fraction of
@@ -1217,12 +1230,14 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         }
         void* p = nullptr;
         cudaError_t pin_err = cudaSuccess;
-        if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
+        if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) need, cudaHostAllocDefault);
         const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
         if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
-        uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
+        uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) need];
         if (raw == nullptr) return false;
         stage_buf_.emplace_back(raw, StageBufFree{pinned});
+        stage_cap_.push_back(need);
+        if (mine != nullptr) mine->push_back(stage_buf_.size() - 1);
         if (pinned && !stage_pin_said_) {
             stage_pin_said_ = true;
             std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
@@ -1405,7 +1420,7 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
 
 void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
     if (todo.empty()) return;
-    if (!direct_.empty()) {
+    if (!direct_.empty() || decode_direct_) {
         // #286: overlapped batches - every role window of 16 blobs in flight at once; a big batch (the profile
         // fill) on up to 4 threads, a decode layer's few misses on this one
         std::atomic<size_t> next{0};
@@ -1569,6 +1584,16 @@ bool FileExpertSource::open_mirror(const std::string& path, double share, std::s
     err = "STRATA_EXPERT_MIRROR: Linux only";
     return false;
 #endif
+}
+
+void FileExpertSource::set_stage_keep(size_t n) {
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    stage_keep_ = n;
+    stage_class_keep_.clear();
+    if (n == 0 || n_layers_ <= 0 || (int64_t) layer_blob_bytes_.size() < n_layers_) return;
+    std::map<uint64_t, size_t> layers;
+    for (int64_t l = 0; l < n_layers_; ++l) ++layers[layer_blob_bytes_[(size_t) l]];
+    for (const auto& [bytes, count] : layers) stage_class_keep_[bytes] = std::max<size_t>(1, n * count / (size_t) n_layers_);
 }
 
 bool FileExpertSource::open_prompt_direct(std::string& why) {
@@ -2186,8 +2211,42 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
     thread_local std::vector<Fill> fills;
     fills.clear();
     uint64_t bytes = 0;
+    // STRATA_STAGE_KEEP: the blobs the stage pool still holds (the decode's recent misses) are copied from RAM.  Each is
+    // marked busy while it is copied, as a fill would be, so claim_stage cannot hand the buffer out under the copy; a
+    // buffer still being filled is read from the drive instead
+    thread_local std::vector<size_t> held;   // per blob: its stage buffer, or SIZE_MAX
+    thread_local std::vector<const uint8_t*> from;   // that buffer's bytes (taken under the lock: the pool may grow)
+    held.assign(n, SIZE_MAX);
+    from.assign(n, nullptr);
+    if (stage_keep_ > 0) {
+        bool any = false;
+        {
+            std::lock_guard<std::mutex> lk(stage_mu_);
+            for (size_t i = 0; i < n; ++i) {
+                if (layers[i] < 0 || experts[i] < 0 || layers[i] >= n_layers_ || experts[i] >= n_expert_) continue;
+                const auto it = stage_of_.find((int64_t) layers[i] * n_expert_ + experts[i]);
+                if (it == stage_of_.end() || stage_busy_[it->second]) continue;
+                stage_busy_[it->second] = 1;
+                held[i] = it->second;
+                from[i] = stage_buf_[it->second].get();
+                any = true;
+            }
+        }
+        if (any) {
+            for (size_t i = 0; i < n; ++i)
+                if (held[i] != SIZE_MAX && dst[i] != nullptr)
+                    std::memcpy(dst[i], from[i], (size_t) layer_blob_bytes_[(size_t) layers[i]]);
+            {
+                std::lock_guard<std::mutex> lk(stage_mu_);
+                for (size_t i = 0; i < n; ++i)
+                    if (held[i] != SIZE_MAX) stage_busy_[held[i]] = 0;
+            }
+            stage_cv_.notify_all();
+        }
+    }
     for (size_t i = 0; i < n; ++i) {
         const int64_t l = layers[i], e = experts[i];
+        if (held[i] != SIZE_MAX) continue;
         if (base_ == nullptr || dst[i] == nullptr || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return false;
         const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
         if (complement_ready_ &&

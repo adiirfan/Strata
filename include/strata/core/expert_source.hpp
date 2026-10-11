@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -593,6 +594,15 @@ public:
     bool open_prompt_direct(std::string& why);
     /// STRATA_EXPERT_MIRROR is open: the direct reads split every layer between the shard and its copy.
     bool mirrored() const { return mirror_fd_ >= 0; }
+    /// STRATA_DECODE_DIRECT=1 (after open_prompt_direct; the GGUF in place): the decode's blob reads - the read-ahead
+    /// workers and a layer's misses - go through read_direct too, on both drives with STRATA_EXPERT_MIRROR.  The GGUF
+    /// in place assembles every blob in a stage buffer anyway, so no kernel reads those pages from the file cache.
+    void set_decode_direct(bool on) { decode_direct_ = on && !pp_direct_.empty() && !role_ptr_.empty(); }
+    bool decode_direct() const { return decode_direct_; }
+    /// STRATA_STAGE_KEEP=N: the stage pool grows to N buffers before it reuses one, so the last N blobs read stay in
+    /// RAM (with direct reads nothing else keeps them).  The buffers are sized exactly per blob size, and each size
+    /// keeps its share of N (by the layers that have it): N x the mean blob of RAM.  0 (the default): as before.
+    void set_stage_keep(size_t n);
     /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
     /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
@@ -690,6 +700,11 @@ private:
     int mirror_main_ = -1;                    ///< STRATA_EXPERT_MIRROR: the shard's index in maps_ (-1: no mirror)
     int mirror_fd_ = -1;                      ///< the copy, O_DIRECT (read_direct only)
     int64_t mirror_cut_ = 0;                  ///< read_direct: a layer's experts from this one on come from the copy
+    bool decode_direct_ = false;              ///< set_decode_direct
+    size_t stage_keep_ = 0;                   ///< set_stage_keep
+    std::vector<uint64_t> stage_cap_;         ///< per stage buffer: its bytes
+    std::map<uint64_t, size_t> stage_class_keep_;              ///< STRATA_STAGE_KEEP: buffers kept per blob size
+    std::map<uint64_t, std::vector<size_t>> stage_class_bufs_; ///< STRATA_STAGE_KEEP: the buffers of each blob size
     bool open_mirror(const std::string& path, double share, std::string& err);
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source

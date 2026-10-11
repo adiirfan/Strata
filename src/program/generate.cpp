@@ -4323,6 +4323,19 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: prompt reads %s (STRATA_PROMPT_DIRECT=1: %s)\n",
                          prompt_direct ? "unbuffered" : "through the file cache", why.c_str());
         }
+        // STRATA_DECODE_DIRECT=1: the decode's blob reads straight from the drive(s) as well (they land in stage buffers,
+        // never in the file cache's pages); STRATA_STAGE_KEEP=N keeps the last N of them in RAM instead
+        if (const char* dv = std::getenv("STRATA_DECODE_DIRECT"); dv != nullptr && std::atoi(dv) != 0 && !src.unbuffered()) {
+            std::string why;
+            if (!prompt_direct) prompt_direct = src.open_prompt_direct(why);
+            src.set_decode_direct(prompt_direct);
+            std::fprintf(stderr, "strata generate: decode reads %s (STRATA_DECODE_DIRECT=1%s%s)\n",
+                         src.decode_direct() ? "unbuffered" : "as before", why.empty() ? "" : ": ", why.c_str());
+        }
+        if (const char* kv = std::getenv("STRATA_STAGE_KEEP"); kv != nullptr && std::atoll(kv) > 0) {
+            src.set_stage_keep((size_t) std::atoll(kv));
+            std::fprintf(stderr, "strata generate: the stage pool keeps up to %lld blobs (STRATA_STAGE_KEEP)\n", std::atoll(kv));
+        }
         if (src.mirrored() && !prompt_direct && !src.unbuffered())
             std::fprintf(stderr, "strata generate: note: STRATA_EXPERT_MIRROR serves only the direct reads "
                                  "(STRATA_PROMPT_DIRECT=1, or an unbuffered file tier); none run here\n");
