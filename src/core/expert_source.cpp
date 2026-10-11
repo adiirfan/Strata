@@ -981,6 +981,7 @@ void FileExpertSource::close() {
     if (mirror_fd_ >= 0) ::close(mirror_fd_);
 #endif
     mirror_fd_ = mirror_main_ = -1;
+    packed_ = false;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_buf_.clear();
@@ -1584,6 +1585,14 @@ bool FileExpertSource::open_mirror(const std::string& path, double share, std::s
         if (paths_[f] == gguf_) mirror_main_ = (int) f;
     if (mirror_main_ < 0) { err = "STRATA_EXPERT_MIRROR: no experts in " + gguf_; return false; }
     mirror_cut_ = n_expert_ - std::llround((double) n_expert_ * std::clamp(share, 0.0, 1.0));
+    {
+        // tools/rtx5080/expert_pack.py's layout: every served expert's blob (gate, up, down) in one 4 KiB-aligned piece
+        const int fh = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        char magic[8] = {};
+        const bool is_pack = fh >= 0 && ::pread(fh, magic, 8, 0) == 8 && std::memcmp(magic, "STRPACK1", 8) == 0;
+        if (fh >= 0) ::close(fh);
+        if (is_pack) return open_packed(path, err);
+    }
     struct stat a{}, b{};
     if (::stat(gguf_.c_str(), &a) != 0 || ::stat(path.c_str(), &b) != 0 || a.st_size != b.st_size) {
         err = "STRATA_EXPERT_MIRROR: " + path + " is missing or not the size of " + gguf_;
@@ -1646,6 +1655,80 @@ void FileExpertSource::set_stage_keep(size_t n) {
     std::map<uint64_t, size_t> layers;
     for (int64_t l = 0; l < n_layers_; ++l) ++layers[layer_blob_bytes_[(size_t) l]];
     for (const auto& [bytes, count] : layers) stage_class_keep_[bytes] = std::max<size_t>(1, n * count / (size_t) n_layers_);
+}
+
+bool FileExpertSource::open_packed(const std::string& path, std::string& err) {
+#if defined(__linux__)
+    auto fail = [&](const std::string& why) { err = "STRATA_EXPERT_MIRROR: " + path + ": " + why; mirror_main_ = -1; return false; };
+    const int fh = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fh < 0) return fail("cannot open it");
+    std::vector<uint8_t> h((size_t) (40 + 24 * n_layers_));
+    const bool got = pread_full(fh, h.data(), h.size(), 0);
+    uint32_t ver = 0, nl = 0, ne = 0, first = 0;
+    uint64_t shard = 0;
+    if (got) {
+        std::memcpy(&ver, h.data() + 8, 4); std::memcpy(&nl, h.data() + 12, 4);
+        std::memcpy(&ne, h.data() + 16, 4); std::memcpy(&first, h.data() + 20, 4); std::memcpy(&shard, h.data() + 24, 8);
+    }
+    struct stat a{};
+    if (!got || ver != 1 || (int64_t) nl != n_layers_ || (int64_t) ne != n_expert_ || ::stat(gguf_.c_str(), &a) != 0 ||
+        (uint64_t) a.st_size != shard) {
+        ::close(fh);
+        return fail("its header does not match " + gguf_ + " (another model or quant?)");
+    }
+    packed_first_ = first;
+    packed_off_.assign((size_t) n_layers_, 0);
+    packed_stride_.assign((size_t) n_layers_, 0);
+    for (int64_t l = 0; l < n_layers_; ++l) {
+        uint64_t blob = 0;
+        std::memcpy(&blob, h.data() + 32 + 24 * l, 8);
+        std::memcpy(&packed_stride_[(size_t) l], h.data() + 40 + 24 * l, 8);
+        std::memcpy(&packed_off_[(size_t) l], h.data() + 48 + 24 * l, 8);
+        bool here = true;
+        for (int r = 0; r < 3; ++r) here = here && role_file_[(size_t) (3 * l + r)] == mirror_main_;
+        if (blob != layer_blob_bytes_[(size_t) l] || !here || packed_stride_[(size_t) l] % 4096 != 0 ||
+            packed_off_[(size_t) l] % 4096 != 0) {
+            ::close(fh);
+            return fail("layer " + std::to_string(l) + " does not match the engine's blobs");
+        }
+    }
+    mirror_cut_decode_ = mirror_cut_;
+    if (const char* dv = std::getenv("STRATA_EXPERT_MIRROR_DECODE_SHARE"); dv != nullptr)
+        mirror_cut_decode_ = n_expert_ - (int64_t) std::llround((double) n_expert_ * std::clamp(std::atof(dv), 0.0, 1.0));
+    if (std::min(mirror_cut_, mirror_cut_decode_) < packed_first_) {
+        ::close(fh);
+        return fail("it holds experts " + std::to_string(packed_first_) + ".. only (made for a smaller share)");
+    }
+    // spot check: every layer's first and last served blob against the shard (its first and last 4 KiB)
+    const int fs = ::open(gguf_.c_str(), O_RDONLY | O_CLOEXEC);
+    bool same = fs >= 0;
+    std::vector<uint8_t> x(4096), y(4096);
+    for (int64_t l = 0; same && l < n_layers_; ++l)
+        for (const int64_t e : {packed_first_, n_expert_ - 1}) {
+            const uint64_t at = packed_off_[(size_t) l] + (uint64_t) (e - packed_first_) * packed_stride_[(size_t) l];
+            const size_t g = (size_t) (3 * l), d3 = (size_t) (3 * l + 2);
+            const uint64_t g0 = (uint64_t) (role_ptr_[g] - maps_[(size_t) mirror_main_].base) + (uint64_t) e * role_bytes_[g];
+            const uint64_t d1 = (uint64_t) (role_ptr_[d3] - maps_[(size_t) mirror_main_].base) + (uint64_t) (e + 1) * role_bytes_[d3];
+            const size_t kg = (size_t) std::min<uint64_t>(4096, role_bytes_[g]), kd = (size_t) std::min<uint64_t>(4096, role_bytes_[d3]);
+            same = pread_full(fs, x.data(), kg, g0) && pread_full(fh, y.data(), kg, at) && std::memcmp(x.data(), y.data(), kg) == 0 &&
+                   pread_full(fs, x.data(), kd, d1 - kd) && pread_full(fh, y.data(), kd, at + layer_blob_bytes_[(size_t) l] - kd) &&
+                   std::memcmp(x.data(), y.data(), kd) == 0;
+            if (!same) { err = "layer " + std::to_string(l) + " expert " + std::to_string(e); break; }
+        }
+    if (fs >= 0) ::close(fs);
+    ::close(fh);
+    if (!same) return fail("its bytes differ from the shard at " + err);
+    mirror_fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (mirror_fd_ < 0) return fail(std::string("cannot open it with O_DIRECT (") + std::strerror(errno) + ")");
+    packed_ = true;
+    std::fprintf(stderr, "strata experts: the direct reads take experts %lld.. (the decode's %lld..) of every layer from "
+                         "the packed copy %s, one read per expert\n", (long long) mirror_cut_, (long long) mirror_cut_decode_, path.c_str());
+    return true;
+#else
+    (void) path;
+    err = "STRATA_EXPERT_MIRROR: Linux only";
+    return false;
+#endif
 }
 
 bool FileExpertSource::open_prompt_direct(std::string& why) {
@@ -1901,6 +1984,11 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) con
             sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
             continue;
         }
+        if (packed_ && f.e >= (decode ? mirror_cut_decode_ : mirror_cut_)) {   // expert_pack.py: the blob in one piece
+            const uint64_t at0 = packed_off_[(size_t) f.layer] + (uint64_t) (f.e - packed_first_) * packed_stride_[(size_t) f.layer];
+            sc.win.push_back({kMirror, at0, packed_stride_[(size_t) f.layer], 0, layer_blob_bytes_[(size_t) f.layer], 0, f.dst, 0, 0});
+            continue;
+        }
         uint64_t at = 0;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * f.layer + r);
@@ -1909,7 +1997,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) con
             const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
             int file = role_file_[i];
-            if (mirror_fd_ >= 0 && file == mirror_main_ && f.e >= (decode ? mirror_cut_decode_ : mirror_cut_))
+            if (!packed_ && mirror_fd_ >= 0 && file == mirror_main_ && f.e >= (decode ? mirror_cut_decode_ : mirror_cut_))
                 file = kMirror;   // same bytes, same offset
             sc.win.push_back({file, a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
             at += per;

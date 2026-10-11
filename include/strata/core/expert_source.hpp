@@ -716,12 +716,16 @@ private:
     int mirror_fd_ = -1;                      ///< the copy, O_DIRECT (read_direct only)
     int64_t mirror_cut_ = 0;                  ///< read_direct: a layer's experts from this one on come from the copy
     int64_t mirror_cut_decode_ = 0;           ///< the same for the decode's reads (STRATA_EXPERT_MIRROR_DECODE_SHARE)
+    bool packed_ = false;                     ///< the copy is expert_pack.py's: whole blobs from packed_first_ on
+    int64_t packed_first_ = 0;
+    std::vector<uint64_t> packed_off_, packed_stride_;   ///< per layer: its first blob's offset, the blob stride
     bool decode_direct_ = false;              ///< set_decode_direct
     size_t stage_keep_ = 0;                   ///< set_stage_keep
     std::vector<uint64_t> stage_cap_;         ///< per stage buffer: its bytes
     std::map<uint64_t, size_t> stage_class_keep_;              ///< STRATA_STAGE_KEEP: buffers kept per blob size
     std::map<uint64_t, std::vector<size_t>> stage_class_bufs_; ///< STRATA_STAGE_KEEP: the buffers of each blob size
     bool open_mirror(const std::string& path, double share, std::string& err);
+    bool open_packed(const std::string& path, std::string& err);
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
