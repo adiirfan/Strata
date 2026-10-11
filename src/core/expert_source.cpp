@@ -555,6 +555,8 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     c.pf_unused = io_pf_unused_.load(std::memory_order_relaxed);
     c.crit_us = io_crit_us_.load(std::memory_order_relaxed);
     c.crit_n = io_crit_n_.load(std::memory_order_relaxed);
+    c.hand_hit = hand_hit_.load(); c.hand_late = hand_late_.load(); c.hand_late_us = hand_late_us_.load();
+    c.hand_now = hand_now_.load(); c.hand_now_us = hand_now_us_.load(); c.hand_now_calls = hand_now_calls_.load();
     return c;
 }
 
@@ -604,6 +606,15 @@ void FileExpertSource::io_stop() {
     for (std::thread& t : io_workers_)
         if (t.joinable()) t.join();
     io_workers_.clear();
+    for (std::deque<Fill> left; ;) {   // claimed blobs a layer waits for: read them here
+        {
+            std::lock_guard<std::mutex> lk(io_mu_);
+            left.swap(io_now_q_);
+        }
+        if (left.empty()) break;
+        for (const Fill& f : left) (void) fill_stage(f.v, f.layer, f.e, f.dst);
+        left.clear();
+    }
 #if defined(__linux__)
     for (int f : io_fds_) ::close(f);
 #endif
@@ -631,8 +642,15 @@ void FileExpertSource::io_worker() {
         int32_t layer, expert;
         {
             std::unique_lock<std::mutex> lk(io_mu_);
-            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty(); });
+            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty() || !io_now_q_.empty(); });
             if (io_quit_) return;
+            if (!io_now_q_.empty()) {   // a layer is waiting for this one (prefetch handed it over, claimed)
+                const Fill f = io_now_q_.front();
+                io_now_q_.pop_front();
+                lk.unlock();
+                (void) fill_stage(f.v, f.layer, f.e, f.dst);
+                continue;
+            }
             layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
             expert = io_q_.back().second;
             io_q_.pop_back();
@@ -1124,7 +1142,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     if (!direct_.empty() || decode_direct_) {   // #286: from the drive; a failed read falls back to the mapping below
         const Fill f{0, layer, expert, dst};
-        if (read_direct(&f, 1)) return true;
+        if (read_direct(&f, 1, true)) return true;
         direct_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
 #if defined(__linux__)
@@ -1313,7 +1331,15 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
         dst = stage_buf_[v].get();
         if (have) {
             // another thread (a prefetch, the adaptive tier) is filling it: wait for that
-            stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
+            if (stage_busy_[v]) {
+                const auto w0 = std::chrono::steady_clock::now();
+                stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
+                hand_late_.fetch_add(1, std::memory_order_relaxed);
+                hand_late_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - w0).count(),
+                                        std::memory_order_relaxed);
+            } else {
+                hand_hit_.fetch_add(1, std::memory_order_relaxed);
+            }
             if (stage_key_[v] != key) return nullptr;   // its fill failed
             lk.unlock();
             crit();
@@ -1377,7 +1403,26 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             }
         }
     }
+    const auto f0 = std::chrono::steady_clock::now();
+    if (decode_direct_ && io_pf_ && !io_workers_.empty() && !todo.empty()) {
+        // STRATA_DECODE_DIRECT: the read-ahead workers read the layer's blobs in parallel, ahead of their predictions
+        // (one thread read them one batch at a time, then copied each out of its bounce buffer); staged_blob waits
+        {
+            std::lock_guard<std::mutex> lk(io_mu_);
+            for (const Fill& f : todo) io_now_q_.push_back(f);
+        }
+        io_cv_.notify_all();
+        hand_now_.fetch_add(todo.size(), std::memory_order_relaxed);
+        hand_now_calls_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     fill_many(todo);
+    if (!todo.empty()) {
+        hand_now_.fetch_add(todo.size(), std::memory_order_relaxed);
+        hand_now_calls_.fetch_add(1, std::memory_order_relaxed);
+        hand_now_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - f0).count(),
+                               std::memory_order_relaxed);
+    }
     if (io_pf_ && !todo.empty()) {
         io_crit_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                               std::memory_order_relaxed);
@@ -1428,7 +1473,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
             for (size_t at; (at = next.fetch_add(16)) < todo.size();) {
                 const size_t k = std::min<size_t>(16, todo.size() - at);
                 const auto t0 = std::chrono::steady_clock::now();
-                const bool ok = read_direct(todo.data() + at, k);
+                const bool ok = read_direct(todo.data() + at, k, true);
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 for (size_t i = at; i < at + k; ++i) {
                     const Fill& f = todo[i];
@@ -1576,8 +1621,15 @@ bool FileExpertSource::open_mirror(const std::string& path, double share, std::s
         mirror_fd_ = mirror_main_ = -1;
         return false;
     }
-    std::fprintf(stderr, "strata experts: the direct reads take experts %lld.. of every layer from the mirror %s\n",
-                 (long long) mirror_cut_, path.c_str());
+    {
+        // scattered 2 MB reads (the decode's) run at about the same rate on both drives even where one is the faster at
+        // long ones, so the decode may split them differently from the prompt
+        const char* dv = std::getenv("STRATA_EXPERT_MIRROR_DECODE_SHARE");
+        const double ds = dv != nullptr ? std::clamp(std::atof(dv), 0.0, 1.0) : std::clamp(share, 0.0, 1.0);
+        mirror_cut_decode_ = std::max(mirror_cut_, n_expert_ - (int64_t) std::llround((double) n_expert_ * ds));
+    }
+    std::fprintf(stderr, "strata experts: the direct reads take experts %lld.. (the decode's %lld..) of every layer from the mirror %s\n",
+                 (long long) mirror_cut_, (long long) mirror_cut_decode_, path.c_str());
     return true;
 #else
     (void) path; (void) share;
@@ -1690,7 +1742,7 @@ bool FileExpertSource::drop_mapping(std::string& why) {
 #endif
 }
 
-bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode) const {
 #if defined(_WIN32)
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
@@ -1857,7 +1909,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
             int file = role_file_[i];
-            if (mirror_fd_ >= 0 && file == mirror_main_ && f.e >= mirror_cut_) file = kMirror;   // same bytes, same offset
+            if (mirror_fd_ >= 0 && file == mirror_main_ && f.e >= (decode ? mirror_cut_decode_ : mirror_cut_))
+                file = kMirror;   // same bytes, same offset
             sc.win.push_back({file, a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
             at += per;
         }

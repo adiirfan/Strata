@@ -12085,6 +12085,11 @@ int main(int argc, char** argv) {
                             (unsigned long long) ic.pf_dropped, (double) ic.pread_bytes / 1e6,
                             (unsigned long long) ic.pread_n, ic.pread_n > 0 ? (double) ic.pread_us / 1e3 / (double) ic.pread_n : 0.0,
                             rounds > 0 ? (double) ic.crit_us / 1e3 / rounds : 0.0);
+                if (rounds > 0)
+                    std::printf("%-24s per round: %.1f staged already, %.1f being read ahead (layers waited %.2f ms), %.1f read on "
+                                "the spot in %.1f layer calls (%.2f ms)\n", "hand-out",
+                                (double) ic.hand_hit / rounds, (double) ic.hand_late / rounds, (double) ic.hand_late_us / 1e3 / rounds,
+                                (double) ic.hand_now / rounds, (double) ic.hand_now_calls / rounds, (double) ic.hand_now_us / 1e3 / rounds);
             }
             if (drive.d.lookahead != nullptr)
                 std::printf("%-24s %lld experts warmed, %lld of the file tier's %lld blob reads had been warmed (%.1f%%); "

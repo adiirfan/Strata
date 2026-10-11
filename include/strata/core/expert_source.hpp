@@ -674,6 +674,8 @@ public:
         uint64_t pf_used = 0, pf_unused = 0;                 ///< prefetched blobs a layer then used / never used
         uint64_t crit_us = 0;                                ///< wall time the decode waited on file reads (prefetch + staged_blob)
         uint64_t crit_n = 0;
+        uint64_t hand_hit = 0, hand_late = 0, hand_late_us = 0;   ///< decode hand-out: staged already / still being read (wait)
+        uint64_t hand_now = 0, hand_now_us = 0, hand_now_calls = 0; ///< read on the spot by the layer (prefetch's fill_many)
     };
     IoCounters io_counters() const;
 
@@ -692,7 +694,8 @@ private:
     void fill_many(const std::vector<Fill>& todo);
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
-    bool read_direct(const Fill* fills, size_t n) const;
+    /// `decode`: the decode's scattered blobs (STRATA_EXPERT_MIRROR_DECODE_SHARE splits them), else the prompt's.
+    bool read_direct(const Fill* fills, size_t n, bool decode = false) const;
     bool open_direct(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
@@ -700,6 +703,7 @@ private:
     int mirror_main_ = -1;                    ///< STRATA_EXPERT_MIRROR: the shard's index in maps_ (-1: no mirror)
     int mirror_fd_ = -1;                      ///< the copy, O_DIRECT (read_direct only)
     int64_t mirror_cut_ = 0;                  ///< read_direct: a layer's experts from this one on come from the copy
+    int64_t mirror_cut_decode_ = 0;           ///< the same for the decode's reads (STRATA_EXPERT_MIRROR_DECODE_SHARE)
     bool decode_direct_ = false;              ///< set_decode_direct
     size_t stage_keep_ = 0;                   ///< set_stage_keep
     std::vector<uint64_t> stage_cap_;         ///< per stage buffer: its bytes
@@ -767,12 +771,14 @@ private:
     std::mutex io_mu_;
     std::condition_variable io_cv_;
     std::deque<std::pair<int32_t, int32_t>> io_q_;   ///< (layer, expert) to read ahead
+    std::deque<Fill> io_now_q_;                      ///< STRATA_DECODE_DIRECT: a layer's claimed blobs, read before io_q_
     bool io_quit_ = false;
     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
         io_crit_us_{0}, io_crit_n_{0};
+    mutable std::atomic<uint64_t> hand_hit_{0}, hand_late_{0}, hand_late_us_{0}, hand_now_{0}, hand_now_us_{0}, hand_now_calls_{0};
     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
     /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob.
     int spans(int64_t layer, int64_t expert, Span* out) const;
