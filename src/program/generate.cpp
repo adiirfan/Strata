@@ -234,6 +234,62 @@ bool refill_blocking() {
     return v;
 }
 
+// STRATA_REFILL_BATCH=N (opt-in, low-RAM work): a prompt's lent slots are refilled N experts at a time - the batch read by
+// STRATA_REFILL_THREADS (default 8) threads into one of two pinned staging buffers, its copies queued while the next
+// batch reads.  The per-expert loop read one blob at a time from the mapping, so with the experts on an SSD one read was
+// in flight.  The same bytes land in the same slots.
+int refill_batch() {
+    static const int v = [] { const char* e = std::getenv("STRATA_REFILL_BATCH"); return e ? std::max(0, std::atoi(e)) : 0; }();
+    return v;
+}
+bool refill_batched(strata::core::ExpertSource& src, strata::core::ExpertCache& cache,
+                    const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n_expert, std::string& err) {
+    static const int threads = [] {
+        const char* e = std::getenv("STRATA_REFILL_THREADS");
+        return e ? std::max(1, std::atoi(e)) : 8;
+    }();
+    const size_t B = (size_t) refill_batch();
+    size_t maxb = 0;
+    for (const auto& pr : lent)
+        maxb = std::max(maxb, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert));
+    maxb = (maxb + 4095) / 4096 * 4096;
+    uint8_t* stage[2] = {nullptr, nullptr};
+    for (auto& st : stage)
+        if (cudaMallocHost((void**) &st, B * maxb) != cudaSuccess) {
+            cudaGetLastError();
+            for (auto& x : stage) if (x != nullptr) cudaFreeHost(x);
+            err = "refill: cannot pin the staging buffers";
+            return false;
+        }
+    bool ok = true;
+    for (size_t at = 0, k = 0; ok && at < lent.size(); at += B, k ^= 1) {
+        const size_t n = std::min(B, lent.size() - at);
+        std::atomic<size_t> next{0};
+        std::atomic<bool> good{true};
+        auto work = [&] {
+            for (size_t j; (j = next.fetch_add(1)) < n;) {
+                const auto& pr = lent[at + j];
+                if (!src.copy_blob(pr.first / n_expert, pr.first % n_expert, stage[k] + j * maxb)) good = false;
+            }
+        };
+        std::vector<std::thread> ts;
+        for (int t = 1; t < threads; ++t) ts.emplace_back(work);
+        work();
+        for (auto& t : ts) t.join();
+        if (!good) { err = "refill: reading a lent expert failed"; ok = false; break; }
+        // the previous batch's copies (out of the other buffer) land before that buffer is read into again
+        if (!cache.sync_queued(err)) { ok = false; break; }
+        for (size_t j = 0; ok && j < n; ++j) {
+            const auto& pr = lent[at + j];
+            const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert);
+            if (!cache.fill_slot_queued(pr.second, stage[k] + j * maxb, err, nb)) ok = false;
+        }
+    }
+    if (ok && !cache.sync_queued(err)) ok = false;
+    for (auto& st : stage) cudaFreeHost(st);
+    return ok;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
@@ -9577,6 +9633,11 @@ int main(int argc, char** argv) {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                if (refill_batch() > 0) {   // STRATA_REFILL_BATCH: batched, parallel reads (see refill_batched)
+                    if (!refill_batched(*srcp, *p.cache, p.lent, g.n_expert, e)) return false;
+                    for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
+                    return true;
+                }
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
@@ -11209,7 +11270,14 @@ int main(int argc, char** argv) {
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
-            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+            if (refill_batch() > 0) {   // STRATA_REFILL_BATCH: batched, parallel reads (see refill_batched)
+                if (!refill_batched(*srcp, xcache, lent, g.n_expert, err)) {
+                    std::fprintf(stderr, "strata generate: refilling the lent slots failed: %s\n", err.c_str());
+                    return 1;
+                }
+                for (const auto& [i, slot] : lent) host_res[(size_t) i] = slot;
+            }
+            else for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                 const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
