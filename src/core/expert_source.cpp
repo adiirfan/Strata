@@ -3116,6 +3116,22 @@ const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
     return blob(layer, expert);
 }
 
+const uint8_t* FileExpertSource::blob_if_ready(int64_t layer, int64_t expert) {
+    // only a staged blob can be "not here yet"; every other kind of hand-out is what blob() does
+    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_ || complement_ready_ ||
+        !staged() || (io_pf_ && role_ptr_.empty() && direct_.empty()))
+        return blob(layer, expert);
+    const int64_t key = layer * n_expert_ + expert;
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    const auto it = stage_of_.find(key);
+    if (it == stage_of_.end() || stage_busy_[it->second]) return nullptr;   // still being read: the caller asks blob() later
+    size_t v = 0;
+    bool fill = false;
+    (void) claim_stage(key, v, fill);   // as staged_blob: refreshes its age, so the pointer holds for this layer
+    hand_hit_.fetch_add(1, std::memory_order_relaxed);
+    return stage_buf_[v].get();
+}
+
 const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -3507,6 +3523,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
     int njobs = 0;
+    // STRATA_POOL_EARLY=1: the experts whose blobs are here are computed first, while the rest are still being read
+    static const bool early = [] { const char* v = std::getenv("STRATA_POOL_EARLY"); return v != nullptr && std::atoi(v) != 0; }();
+    static thread_local std::vector<int64_t> later;   // entries whose blob was not here yet
+    later.clear();
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -3532,8 +3552,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
+            if (jo == -2) {   // STRATA_POOL_EARLY: this expert waits for the second pass, with all its entries
+                later.push_back(i);
+                continue;
+            }
             if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
+                const uint8_t* b = early ? d.src->blob_if_ready(d.layers, e) : d.src->blob(d.layers, e);
+                if (b == nullptr && early) {
+                    jo = -2;
+                    later.push_back(i);
+                    continue;
+                }
                 if (b == nullptr) {
                     d.failed = true;
                     d.fail = "the expert source could not produce a blob";
@@ -3556,9 +3585,42 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
-    if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    auto run_jobs = [&](int from, int to) {
+        if (to <= from) return;
+        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data() + from, to - from);
+        else d.pool->run_split_multi(d.jobs_multi.data() + from, to - from);
+    };
+    if (later.empty()) {
+        run_jobs(0, njobs);
+    } else {   // STRATA_POOL_EARLY: what is here, then the rest as it lands
+        const int ready = njobs;
+        run_jobs(0, ready);
+        for (const int64_t i : later) {
+            const int64_t t = i / k, e = ids[i];
+            int16_t& jo = d.job_of[(size_t) e];
+            if (jo < 0) {   // -2: deferred in the first pass
+                const uint8_t* b = d.src->blob(d.layers, e);
+                if (b == nullptr) {
+                    d.failed = true;
+                    d.fail = "the expert source could not produce a blob";
+                    d.fail_layer = d.layers;
+                    d.fail_expert = e;
+                    ++d.missing;
+                    return;
+                }
+                jo = (int16_t) njobs++;
+                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+                nj.blob = b;
+                nj.nt = 0;
+            }
+            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+            jb.act[jb.nt] = &d.act_multi[(size_t) t];
+            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+            jb.out[jb.nt] = out + (size_t) i * H;
+            ++jb.nt;
+            ++d.multi_entries;
+        }
+        run_jobs(ready, njobs);
     }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;

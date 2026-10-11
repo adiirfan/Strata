@@ -147,6 +147,9 @@ public:
     /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
     /// asynchronously long after the call (the adaptive tier's swap-ins).  Defaults to `blob`.
     virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
+    /// `blob`, but nullptr instead of waiting when the blob is still being read (STRATA_POOL_EARLY: the pool computes
+    /// what is here first).  Defaults to `blob`.
+    virtual const uint8_t* blob_if_ready(int64_t layer, int64_t expert) { return blob(layer, expert); }
 
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
@@ -618,6 +621,7 @@ public:
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    const uint8_t* blob_if_ready(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
     /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
